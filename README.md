@@ -2,6 +2,8 @@
 
 A production-ready Telegram **userbot** that silently captures movie/series files from source groups and feeds them into your auto-filter bot's private index channel — building your database on autopilot, 24/7.
 
+**Deploy anywhere in minutes** — Railway, Render, Fly.io, Heroku, Docker VPS, or bare Python on any Linux server.
+
 > **For agents:** Read this entire file before making changes. See [Agent Reference](#-agent-reference) at the bottom for rules, known bugs, and what to build next.
 
 ---
@@ -9,10 +11,16 @@ A production-ready Telegram **userbot** that silently captures movie/series file
 ## Table of Contents
 
 - [How It Works](#how-it-works)
-- [Why Userbot Not Bot](#why-userbot-not-bot)
+- [Before You Deploy](#before-you-deploy)
+- [🚀 Deploy — Pick Your Platform](#-deploy--pick-your-platform)
+  - [Railway](#-railway-recommended--easiest)
+  - [Render](#-render-free-tier-available)
+  - [Fly.io](#-flyio-free-tier-available)
+  - [Docker (VPS or local)](#-docker-vps-or-local)
+  - [Bare VPS (no Docker)](#-bare-vps-no-docker)
+  - [Heroku](#-heroku)
 - [Capture Modes](#capture-modes)
 - [File Structure](#file-structure)
-- [Quick Setup](#quick-setup)
 - [Environment Variables](#environment-variables)
 - [forwarder.py Commands](#forwarderpy-commands)
 - [bot_capture.py Commands](#bot_capturepy-commands)
@@ -45,39 +53,263 @@ A production-ready Telegram **userbot** that silently captures movie/series file
 3. `seen_db.py` checks `file_unique_id` — skips if already forwarded (cross-group dedup)
 4. `caption_cleaner.py` strips `@watermarks` and `t.me/` links before forwarding
 5. Your auto-filter bot indexes the file → users can search it immediately
+6. Dashboard at `https://your-app.domain/` shows live stats
 
 **Connected repo:** [Auto-filter-bot-4](https://github.com/azizthekiller123/Auto-filter-bot-4) — this forwarder feeds that bot's index channel(s).
 
 ---
 
-## Why Userbot Not Bot
+## Before You Deploy
 
-You **cannot** add a regular Telegram bot to someone else's group without admin permission (`CHAT_ADMIN_REQUIRED` error). A **userbot** is a regular Telegram account running as a script — it joins groups exactly like a human member, no permission needed.
+You need these 3 things regardless of which platform you choose:
 
-| | Regular Bot | Userbot (this repo) |
-|---|---|---|
-| Join other groups | ❌ Needs admin | ✅ Join like any user |
-| Read message history | ❌ Only if added first | ✅ Full access |
-| Visible to group admins | ✅ Appears as a bot | ✅ Appears as normal user |
-| Requires `SESSION_STRING` | ❌ | ✅ Generate with `session_gen.py` |
+### 1. Telegram API Credentials
+Go to [my.telegram.org](https://my.telegram.org) → **API Development Tools** → copy `API_ID` and `API_HASH`.
+> Use a **secondary Telegram account**, not your main.
+
+### 2. Session String (one-time, run locally)
+```bash
+pip install pyrofork tgcrypto-pyrofork python-dotenv
+python session_gen.py
+```
+Enter phone number + verification code → copy the printed `SESSION_STRING` (starts with `BQA...`).
+> ⚠️ Never commit SESSION_STRING to git. Never share it. It grants full account access.
+
+### 3. Your Destination Channel ID
+Forward any message from your index channel to [@userinfobot](https://t.me/userinfobot) → copy the `id` (a negative number like `-1001234567890`).
+
+---
+
+## 🚀 Deploy — Pick Your Platform
+
+---
+
+### ⭐ Railway (recommended — easiest)
+
+**Cost:** Free tier available (500h/month) | Paid from $5/mo for 24/7
+
+1. Fork this repo on GitHub
+2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub** → select your fork
+3. In Railway → your service → **Variables** tab, add:
+
+| Variable | Value |
+|---|---|
+| `API_ID` | from my.telegram.org |
+| `API_HASH` | from my.telegram.org |
+| `SESSION_STRING` | from `python session_gen.py` |
+| `DEST_CHANNEL` | your index channel ID (e.g. `-1001234567890`) |
+| `SOURCE_CHATS` | comma-separated groups (e.g. `CineAlliance,MoviesHub`) |
+| `ADMINS` | your Telegram user ID |
+
+4. Railway auto-deploys. Check **Deployments** tab for ✅ Active (~2 min)
+5. Visit your Railway URL → live dashboard ✓
+
+**Persistent storage:** Railway provides ephemeral storage by default. Add a Railway Volume in your service settings for persistence (chats, seen DB, routing survive redeploys).
+
+---
+
+### 🎨 Render (free tier available)
+
+**Cost:** Free tier (spins down after inactivity) | Starter $7/mo for always-on
+
+**Option A — Blueprint (one click):**
+1. Fork this repo
+2. Go to [render.com](https://render.com) → **New** → **Blueprint** → connect your fork
+3. Render reads `render.yaml` automatically — creates the worker + 1GB persistent disk
+4. Add secrets in the Render dashboard: `API_ID`, `API_HASH`, `SESSION_STRING`, `DEST_CHANNEL`, `ADMINS`
+5. Click **Apply** → deploys automatically
+
+**Option B — Manual:**
+1. Render → **New Worker** → connect your GitHub fork
+2. Build command: `pip install -r requirements.txt`
+3. Start command: `python forwarder.py`
+4. Add a **Disk** → mount path `/app/data`, size 1GB
+5. Add environment variables (same as above)
+
+**Disk env vars** (pre-set in `render.yaml`, set manually if doing Option B):
+```
+TRACKER_FILE=/app/data/forwarded.json
+CHATS_DB_FILE=/app/data/chats.json
+BOTS_DB_FILE=/app/data/bots.json
+SEEN_DB_FILE=/app/data/seen.json
+ROUTING_FILE=/app/data/routing.json
+```
+
+---
+
+### ✈️ Fly.io (free tier available)
+
+**Cost:** Free allowance (3 shared-cpu VMs) | ~$2/mo for persistent 1GB volume
+
+```bash
+# Install flyctl
+curl -L https://fly.io/install.sh | sh
+
+# Clone your fork
+git clone https://github.com/YOUR_USERNAME/tg-file-forwarder
+cd tg-file-forwarder
+
+# Launch (reads fly.toml automatically)
+fly launch --name tg-file-forwarder --no-deploy
+
+# Create persistent volume for data files
+fly volumes create forwarder_data --size 1 --region sin
+
+# Set secrets (never visible in logs)
+fly secrets set \
+  API_ID=12345678 \
+  API_HASH=abcdef1234 \
+  SESSION_STRING="BQA..." \
+  DEST_CHANNEL=-1001234567890 \
+  SOURCE_CHATS=CineAlliance,MoviesHub \
+  ADMINS=123456789
+
+# Deploy
+fly deploy
+
+# View logs
+fly logs
+```
+
+**Change region** in `fly.toml` → `primary_region`: `sin` (Singapore), `nrt` (Tokyo), `fra` (Frankfurt), `lax` (Los Angeles).
+
+---
+
+### 🐳 Docker (VPS or local)
+
+Works on any server or computer with Docker installed — DigitalOcean, Linode, Vultr, Hetzner, your home server, etc.
+
+**Setup:**
+```bash
+# 1. Clone your fork
+git clone https://github.com/YOUR_USERNAME/tg-file-forwarder
+cd tg-file-forwarder
+
+# 2. Create your .env file
+cp .env.example .env
+nano .env   # fill in API_ID, API_HASH, SESSION_STRING, DEST_CHANNEL, ADMINS
+
+# 3. Start with docker compose
+docker compose up -d
+
+# 4. View live logs
+docker compose logs -f
+
+# 5. Visit dashboard
+open http://localhost:8080
+```
+
+**To run bot_capture.py instead of forwarder.py:**
+Edit `docker-compose.yml` → change `command: python forwarder.py` → `command: python bot_capture.py`
+
+**To run BOTH at the same time:**
+Uncomment the `bot_capture` service in `docker-compose.yml` (already written, just uncomment).
+
+**Update after a git pull:**
+```bash
+git pull
+docker compose down && docker compose up -d --build
+```
+
+**Data persists** in a named Docker volume (`forwarder_data`) — survives container restarts and `docker compose down/up`.
+To see where data is stored: `docker volume inspect tg-file-forwarder_forwarder_data`
+
+---
+
+### 🖥️ Bare VPS (no Docker)
+
+For Ubuntu 22.04 / Debian 11–12. Runs the forwarder in a background `screen` session.
+
+```bash
+# 1. Clone your fork
+git clone https://github.com/YOUR_USERNAME/tg-file-forwarder
+cd tg-file-forwarder
+
+# 2. Fill in your environment variables
+cp .env.example .env
+nano .env
+
+# 3. Run the setup script — installs deps, starts in background
+chmod +x setup.sh
+./setup.sh
+```
+
+The script will:
+- Install Python 3 and `screen` if not present
+- Install Python dependencies
+- Check your `.env` for required variables
+- Ask which script to run (forwarder / bot_capture / multi_forwarder)
+- Start it in a named `screen` session
+
+**Manage the running forwarder:**
+```bash
+screen -r forwarder         # attach to see live logs
+# Ctrl+A then D              # detach (leave running in background)
+screen -S forwarder -X quit # stop the forwarder
+./setup.sh                  # restart after code changes or git pull
+```
+
+**Auto-start on reboot** (add to crontab):
+```bash
+crontab -e
+# Add this line:
+@reboot cd /path/to/tg-file-forwarder && ./setup.sh
+```
+
+---
+
+### 🟣 Heroku
+
+**Cost:** No free tier (Eco dynos from $5/mo)
+
+```bash
+# Install Heroku CLI, then:
+heroku login
+heroku create tg-file-forwarder
+
+# Set config vars
+heroku config:set \
+  API_ID=12345678 \
+  API_HASH=abcdef1234 \
+  SESSION_STRING="BQA..." \
+  DEST_CHANNEL=-1001234567890 \
+  SOURCE_CHATS=CineAlliance \
+  ADMINS=123456789
+
+# Heroku uses Procfile automatically:
+# worker: python forwarder.py
+
+# Deploy
+git push heroku main
+
+# View logs
+heroku logs --tail
+```
+
+> ⚠️ Heroku has no persistent filesystem. `chats.json`, `seen.json` etc. will reset on every redeploy. For production use on Heroku, use Railway or Render instead (both have persistent disk support).
+
+---
+
+### Platform Comparison
+
+| Platform | Free Tier | Persistent Disk | Ease | Best For |
+|---|---|---|---|---|
+| **Railway** | 500h/mo | Add-on volume | ⭐⭐⭐ | Best all-round |
+| **Render** | Spins down | ✅ 1GB included | ⭐⭐⭐ | Free 24/7 with paid |
+| **Fly.io** | 3 VMs free | ✅ 1GB volume | ⭐⭐ | Lowest cost |
+| **Docker VPS** | Pay VPS | ✅ Named volume | ⭐⭐ | Full control |
+| **Bare VPS** | Pay VPS | ✅ Local disk | ⭐⭐⭐ | Simplest on VPS |
+| **Heroku** | ❌ | ❌ Ephemeral | ⭐⭐ | Not recommended |
 
 ---
 
 ## Capture Modes
 
-This repo has two capture scripts. Run one or both:
-
 | Mode | Script | Captures | Use when |
 |---|---|---|---|
-| **All-file** | `forwarder.py` | Every file from watched groups | Maximum coverage — user uploads + bot files |
-| **Bot-only** | `bot_capture.py` | Only files sent by a specific bot per group | Only clean verified bot-served movie files |
-| **Multi-account** | `multi_forwarder.py` | Same as forwarder.py but uses account pool | FloodWait is a problem, need 2–3× throughput |
-
-**Recommended for Cine Alliance-style groups:**
-- Use `bot_capture.py` — captures only what the group's auto-filter bot sends, skips all user spam
-
-**Recommended for general movie groups:**
-- Use `forwarder.py` — captures everything, `seen_db` handles dedup
+| **All-file** | `forwarder.py` | Every file from watched groups | Maximum coverage |
+| **Bot-only** | `bot_capture.py` | Only files from a specific bot per group | Only verified bot files |
+| **Multi-account** | `multi_forwarder.py` | Same as forwarder.py with account rotation | FloodWait is frequent |
 
 ---
 
@@ -86,136 +318,43 @@ This repo has two capture scripts. Run one or both:
 ```
 tg-file-forwarder/
 │
+├── Dockerfile           # Docker image — works on any Docker host
+├── docker-compose.yml   # Local dev + self-hosted VPS Docker setup
+├── .dockerignore        # Keeps image lean (no .env, no .session files)
+├── fly.toml             # Fly.io deploy config (fly deploy)
+├── render.yaml          # Render blueprint (auto-detected by Render)
+├── setup.sh             # Bare VPS quick-start script (Ubuntu/Debian)
+├── Procfile             # Railway + Heroku: worker: python forwarder.py
+├── railway.toml         # Railway: restartPolicyType: always
+│
 ├── forwarder.py         # ★ ALL-FILE CAPTURE — main entry point
-│                        #   Real-time watcher: all files from watched groups
-│                        #   Integrates: routing, dedup, caption cleaning, dashboard
 │                        #   Commands: /addchat /removechat /route /dupstats /discover /suggest
 │
 ├── bot_capture.py       # ★ BOT-ONLY CAPTURE
-│                        #   Only forwards files sent by a registered target bot
 │                        #   Commands: /setbot /removebot /listbots /capturestatus
 │
-├── multi_forwarder.py   # ★ MULTI-ACCOUNT CAPTURE
-│                        #   Same as forwarder.py but uses AccountPool for FloodWait rotation
-│                        #   Replace forwarder.py in Procfile or run as worker2
+├── multi_forwarder.py   # ★ MULTI-ACCOUNT CAPTURE (FloodWait rotation)
 │                        #   Commands: /addchat /route /routes /poolstatus
 │
 ├── account_pool.py      # Multi-account FloodWait rotation engine
-│                        #   AccountPool.create() loads SESSION_STRING, _2, _3 from env
-│                        #   pool.forward(message, dest) auto-rotates on FloodWait
-│                        #   status() shows per-account stats and flood state
-│
-├── router.py            # Multi-destination routing
-│                        #   get_destination(filename, source_chat) → correct channel ID
-│                        #   detect_type() → "series" | "south" | "movie" via filename regex
-│                        #   Per-source overrides stored in routing.json (/route command)
-│                        #   Env vars: DEST_MOVIES, DEST_SERIES, DEST_SOUTH, DEST_CHANNEL
-│
-├── seen_db.py           # Duplicate detection
-│                        #   Tracks file_unique_id in seen.json (in-memory cached set)
-│                        #   is_seen() / mark_seen() used by safe_forward() in utils.py
-│                        #   Same file in two groups → forwarded once, skipped once
-│
+├── router.py            # Multi-destination routing (movies/series/south)
+├── seen_db.py           # Duplicate detection (file_unique_id → seen.json)
 ├── caption_cleaner.py   # Caption watermark remover
-│                        #   Strips @username, t.me/, [TamilMV], "Powered by" etc.
-│                        #   clean(caption) → cleaned string or None
-│                        #   Controlled by CLEAN_CAPTIONS env var (default: true)
+├── discovery.py         # Source auto-discovery (/discover /suggest)
+├── dashboard.py         # aiohttp live status page at PORT
 │
-├── discovery.py         # Source auto-discovery
-│                        #   find_joined_sources() — scans joined groups for movie sources
-│                        #   search_public_sources() — searches Telegram for public groups
-│                        #   Called by /discover and /suggest commands in forwarder.py
-│
-├── dashboard.py         # Live web status page (aiohttp)
-│                        #   GET /           → HTML dashboard (auto-refreshes every 30s)
-│                        #   GET /api/stats  → JSON stats
-│                        #   GET /health     → {"status":"ok"}
-│                        #   start_dashboard() is an async task started by forwarder.py
-│
-├── bots_db.py           # Bot-group mapping for bot_capture.py
-│                        #   set_bot() / remove_bot() / get_bot_by_chat_id()
-│                        #   Persists to bots.json
-│
-├── bulk_dump.py         # One-time historical dump
-│                        #   Iterates entire chat history, forwards all files
-│                        #   Resume-safe: saves progress to forwarded.json
-│
-├── chats_db.py          # Dynamic source chat list
-│                        #   add_chat() / remove_chat() — updated by /addchat
-│                        #   Persists to chats.json
-│
-├── utils.py             # Shared helpers (used by all capture scripts)
-│                        #   safe_forward(msg, dest, skip_duplicates=True, clean_captions=True)
-│                        #   Handles FloodWait, dedup check, caption cleaning in one call
-│                        #   get_unique_id() / is_allowed_file() / get_file_name() / human_size()
-│
-├── tracker.py           # Bulk dump progress tracker
-│                        #   is_done(id) / mark_done(id) — skips already-forwarded messages
-│
-├── config.py            # All settings from environment variables
-│                        #   SystemExit with clear message if required vars are missing
-│
+├── bots_db.py           # Bot-group mapping (bot_capture.py)
+├── bulk_dump.py         # One-time history dump (resume-safe)
+├── chats_db.py          # Dynamic source list (/addchat)
+├── config.py            # All settings from env vars
+├── tracker.py           # Bulk dump progress
+├── utils.py             # safe_forward() — FloodWait + dedup + caption clean
 ├── session_gen.py       # One-time session string generator
-│                        #   Run locally once: python session_gen.py
 │
-├── requirements.txt     # pyrofork==2.3.45, tgcrypto-pyrofork, python-dotenv, aiohttp
-├── Procfile             # Railway: worker: python forwarder.py
-├── railway.toml         # Railway: restartPolicyType: always
+├── requirements.txt     # pyrofork==2.3.45, tgcrypto-pyrofork, aiohttp
 ├── .env.example         # All env vars documented with examples
 └── AGENT_SESSION_NOTES.md  # Full project context for agents
 ```
-
----
-
-## Quick Setup
-
-### Step 1 — Get Telegram API Credentials
-Go to [my.telegram.org](https://my.telegram.org) → **API Development Tools** → copy `API_ID` and `API_HASH`.
-
-> Use a **secondary Telegram account**, not your main.
-
-### Step 2 — Generate Session String (run locally, one time only)
-```bash
-pip install pyrofork tgcrypto-pyrofork python-dotenv
-python session_gen.py
-```
-Enter phone number, paste the verification code → copy the printed `SESSION_STRING` (starts with `BQA...`).
-
-> ⚠️ **Never commit SESSION_STRING to git.** It grants full account access.
-
-### Step 3 — Get Your Destination Channel ID
-Forward any message from the channel to [@userinfobot](https://t.me/userinfobot) → copy the `id` (negative number like `-1001234567890`).
-
-### Step 4 — Find Your Telegram User ID
-Message [@userinfobot](https://t.me/userinfobot) → copy your `id` → this is your `ADMINS` value.
-
-### Step 5 — Join Source Groups
-Log into Telegram with your secondary account and join every group you want to capture from.
-
-### Step 6 — Deploy to Railway
-
-1. Fork this repo → [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub**
-2. In Railway → **Variables** tab, add:
-
-```
-API_ID          = (from my.telegram.org)
-API_HASH        = (from my.telegram.org)
-SESSION_STRING  = (from session_gen.py)
-DEST_CHANNEL    = -1001234567890
-SOURCE_CHATS    = CineAlliance,MoviesHDHub
-ADMINS          = 123456789
-```
-
-3. Optional — set up routing:
-```
-DEST_MOVIES = -1001111111111
-DEST_SERIES = -1002222222222
-DEST_SOUTH  = -1003333333333
-```
-
-4. Railway auto-deploys. Check **Deployments** tab for ✅ Active (~2 min)
-5. Visit `https://your-app.railway.app/` → see the live dashboard
-6. DM the userbot: `/addchat CineAlliance` to add more sources at runtime
 
 ---
 
@@ -241,17 +380,28 @@ DEST_SOUTH  = -1003333333333
 | `BATCH_SIZE` | ⚡ | `200` | Messages per API call in bulk_dump.py |
 | `ALLOWED_TYPES` | ⚡ | `document,video` | File types: document, video, audio, photo |
 | `LOG_CHANNEL` | ⚡ | — | Startup/addchat notifications sent here |
+| `PORT` | ⚡ | `8080` | Dashboard port (set automatically by Railway/Render/Fly) |
 | `TRACKER_FILE` | ⚡ | `forwarded.json` | Bulk dump progress |
 | `CHATS_DB_FILE` | ⚡ | `chats.json` | Dynamic source list |
 | `BOTS_DB_FILE` | ⚡ | `bots.json` | Bot-group mapping (bot_capture.py) |
 | `SEEN_DB_FILE` | ⚡ | `seen.json` | Duplicate detection store |
 | `ROUTING_FILE` | ⚡ | `routing.json` | Per-source routing overrides |
 
+**For persistent storage** on Docker/Fly/Render, set the `*_FILE` paths to your mounted volume:
+```
+TRACKER_FILE=/app/data/forwarded.json
+CHATS_DB_FILE=/app/data/chats.json
+BOTS_DB_FILE=/app/data/bots.json
+SEEN_DB_FILE=/app/data/seen.json
+ROUTING_FILE=/app/data/routing.json
+```
+The `Dockerfile`, `fly.toml`, `render.yaml`, and `docker-compose.yml` already set these defaults.
+
 ---
 
 ## forwarder.py Commands
 
-DM the userbot account directly. All commands are admin-only (`ADMINS` env var).
+DM the userbot. All commands are admin-only (`ADMINS` env var).
 
 | Command | Description |
 |---|---|
@@ -261,20 +411,10 @@ DM the userbot account directly. All commands are admin-only (`ADMINS` env var).
 | `/fwrstatus` | Full stats: forwarded, dedup, routing, caption clean |
 | `/route <source> <channel>` | Override destination for a specific source |
 | `/routes` | Show all routing rules and auto-detect config |
-| `/dupstats` | Duplicate detection stats (seen DB size, session skips) |
-| `/discover` | Scan joined groups — find ones that look like movie sources |
-| `/suggest <keyword>` | Search Telegram for public groups matching keyword |
+| `/dupstats` | Duplicate detection stats |
+| `/discover` | Scan joined groups for movie sources |
+| `/suggest <keyword>` | Search Telegram for public groups |
 | `/help` | Show all commands |
-
-**Examples:**
-```
-/addchat CineAlliance
-/route CineAlliance -1001111111111
-/routes
-/dupstats
-/discover
-/suggest 4k movies hindi dubbed
-```
 
 ---
 
@@ -285,17 +425,8 @@ DM the userbot account directly. All commands are admin-only (`ADMINS` env var).
 | `/setbot <group> <bot_username>` | Register which bot to watch — auto-resolves bot ID |
 | `/removebot <group>` | Stop targeted capture for a group |
 | `/listbots` | Show all registered bot-group pairs |
-| `/capturestatus` | Live capture stats: captured, skip rate, session totals |
+| `/capturestatus` | Live capture stats |
 | `/help` | Show all commands |
-
-**Example:**
-```
-/setbot CineAlliance CineAllianceBotUsername
-/listbots
-/capturestatus
-```
-
-**How /setbot works:** Calls `client.get_users("CineAllianceBotUsername")` → resolves numeric ID → saves `{group_id: {bot_id, bot_username}}` to `bots.json`. From then on every message in that group is checked — only forwards if `sender.id == registered_bot_id` AND message has a file.
 
 ---
 
@@ -307,159 +438,61 @@ Route different content types to different index channels automatically:
 Movie file       → DEST_MOVIES   (e.g. "Inception 2010 1080p.mkv")
 Series episode   → DEST_SERIES   (e.g. "Breaking Bad S05E14.mkv")
 South Indian     → DEST_SOUTH    (e.g. "KGF Chapter 2 Hindi Dubbed.mkv")
-Fallback         → DEST_CHANNEL  (everything else)
+Fallback         → DEST_CHANNEL
 ```
 
-**Detection patterns (router.py):**
-- **Series:** `S01E01`, `S01`, `Season 1`, `Episode 3`, `Complete`
-- **South:** `Tamil`, `Telugu`, `Malayalam`, `Kannada`, `Hindi Dubbed`, `South Indian`
-- **Movie:** anything that doesn't match the above
-
-**Per-source override:** `/route CineAlliance -1001111111111` — all files from Cine Alliance go to that specific channel regardless of filename.
-
-**View all rules:** `/routes`
+Set env vars `DEST_MOVIES`, `DEST_SERIES`, `DEST_SOUTH`. Use `/route <source> <channel>` for per-source overrides. View all rules with `/routes`.
 
 ---
 
 ## Duplicate Detection
 
-Every forwarded file is tracked by its Telegram `file_unique_id` in `seen.json`.
-
-- Same movie posted in both Cine Alliance and Movies Hub → forwarded once, skipped once
-- Works across sessions — `seen.json` survives restarts (on Railway persistent disk)
-- `safe_forward()` in `utils.py` runs the check automatically — no extra code needed in any script
-- `/dupstats` shows session skip count and total seen DB size
-
-**How it works:**
-```python
-uid = message.document.file_unique_id  # Telegram's global unique key
-if uid in seen.json:
-    skip()
-else:
-    forward() → add uid to seen.json
-```
+Every forwarded file is tracked by `file_unique_id` in `seen.json`. Same movie posted in two groups → forwarded once, skipped once. Works across sessions. Built into `safe_forward()` automatically — no extra setup.
 
 ---
 
 ## Caption Watermark Removal
 
-Before forwarding, `caption_cleaner.py` strips all promotional content from the file caption:
-
-**Removed patterns:**
-- `@channel_username` mentions
-- `t.me/channel_link` links
-- `https://...` and `http://...` URLs
-- `[TamilMV]`, `[www.1337x.to]`, `[MoviesHub]` tags
-- Lines starting with: `Powered by`, `Source:`, `Join:`, `For more movies`, `Visit us`
-- Separator lines (`---`, `•••`)
-
-**Toggle:** set `CLEAN_CAPTIONS=false` to disable (default: `true`).
-
-This uses `message.copy(dest, caption=cleaned)` instead of `message.forward(dest)` when there's a caption to clean. The file itself is unchanged — only the caption text is cleaned.
+`caption_cleaner.py` strips before forwarding: `@username`, `t.me/` links, `[TamilMV]` tags, `Powered by:`, `Join:`, any URL. Toggle with `CLEAN_CAPTIONS=false`.
 
 ---
 
 ## Multi-Account Forwarding
 
-When Account 1 hits FloodWait, `account_pool.py` instantly switches to Account 2:
-
-```
-Account 1 → FloodWait 60s → Account 2 takes over
-Account 2 → FloodWait 30s → Account 3 takes over
-Account 3 → FloodWait 20s → Account 1 available again
-```
-
-**Setup:**
-```
-SESSION_STRING   = BQA...  ← Account 1 (already set)
-SESSION_STRING_2 = BQA...  ← Account 2
-SESSION_STRING_3 = BQA...  ← Account 3
-```
-
-**Deploy:**
-
-Option A — Replace `forwarder.py` in `Procfile`:
-```
-worker: python multi_forwarder.py
-```
-
-Option B — Run as a second worker alongside `forwarder.py`:
-```
-worker:  python forwarder.py
-worker2: python multi_forwarder.py
-```
-
-**Command:** `/poolstatus` — shows per-account forwarded count, FloodWait state, and availability.
+When Account 1 hits FloodWait, switches to Account 2 instantly. Set `SESSION_STRING_2` and `SESSION_STRING_3`. Change Procfile to `python multi_forwarder.py`. Use `/poolstatus` to see per-account stats.
 
 ---
 
 ## Source Auto-Discovery
 
-### /discover — scan your joined groups
-```
-/discover
-```
-Scans all groups the userbot is already a member of. Returns groups with movie-related titles/descriptions, sorted by member count.
+- `/discover` — scan groups the userbot already joined, find movie-related ones
+- `/suggest <keyword>` — search Telegram for public groups (`/suggest 4k movies hindi dubbed`)
 
-### /suggest — search Telegram
-```
-/suggest 4k movies
-/suggest hindi dubbed 1080p
-/suggest south indian movies
-```
-Calls `client.search_public_chats(query)` to find public groups. Returns results sorted by members.
-
-Both commands show: group name, @username or ID, member count. Use `/addchat <username>` to add any result immediately.
+Both return group names, usernames, member counts. Use `/addchat <username>` to add any result.
 
 ---
 
 ## Web Dashboard
 
-After deploying to Railway, visit your app URL to see the live status page:
+Visit your app URL after deploying:
+- `https://your-app.domain/` → HTML dashboard (auto-refreshes every 30s)
+- `https://your-app.domain/api/stats` → JSON stats
+- `https://your-app.domain/health` → `{"status": "ok"}`
 
-```
-https://your-app.railway.app/           → HTML dashboard
-https://your-app.railway.app/api/stats  → JSON stats
-https://your-app.railway.app/health     → health check
-```
-
-**Dashboard shows:**
-- Files forwarded this session
-- Total unique files in seen DB (all-time)
-- Duplicates skipped
-- Failed forwards
-- Active source count
-- Uptime
-- Routing config (which channel gets which content type)
-- All active source chats
-
-Auto-refreshes every 30 seconds. The dashboard runs as an `asyncio.create_task()` inside `forwarder.py` on the same process — no extra worker needed.
+Shows: forwarded count, seen DB size, duplicates skipped, failed, source list, routing config, uptime.
 
 ---
 
 ## Bulk History Dump
 
-Pull ALL historical files from a group (runs once, can be resumed):
+Pull ALL historical files from a group before switching to real-time:
 
 ```bash
+python bulk_dump.py CineAlliance    # dump specific group
 python bulk_dump.py                  # dump all SOURCE_CHATS
-python bulk_dump.py CineAlliance     # dump specific group
-python bulk_dump.py -100987654321
 ```
 
-- Saves progress to `forwarded.json` after every file — safe to interrupt with Ctrl+C
-- Resumes exactly where it stopped on next run
-- Can take hours for large groups — run overnight
-- Sends summary to `LOG_CHANNEL` when complete
-
-**Typical workflow for a new source:**
-```bash
-# 1. First: dump all history (run once)
-python bulk_dump.py CineAlliance
-
-# 2. Then: add to real-time forwarder
-/addchat CineAlliance
-```
+Resume-safe — saves progress to `forwarded.json` after every file. Safe to interrupt with Ctrl+C.
 
 ---
 
@@ -476,58 +509,33 @@ python bulk_dump.py CineAlliance
 
 ### ✅ Built
 
-| Feature | File(s) | Notes |
-|---|---|---|
-| Real-time all-file capture | `forwarder.py` | /addchat at runtime, no redeploy |
-| Bot-targeted capture | `bot_capture.py` | /setbot auto-resolves bot ID |
-| Multi-account FloodWait rotation | `multi_forwarder.py`, `account_pool.py` | SESSION_STRING_2/3 |
-| Multi-destination routing | `router.py` | DEST_MOVIES/SERIES/SOUTH + /route override |
-| Duplicate detection | `seen_db.py`, `utils.py` | file_unique_id, cross-group dedup |
-| Caption watermark removal | `caption_cleaner.py`, `utils.py` | 8 regex patterns, CLEAN_CAPTIONS toggle |
-| Source auto-discovery | `discovery.py` | /discover (joined) + /suggest (search) |
-| Web dashboard | `dashboard.py` | aiohttp at PORT, auto-refresh, JSON API |
-| Bulk history dump (resume-safe) | `bulk_dump.py` | forwarded.json progress tracking |
-| Bot-group mapping storage | `bots_db.py` | bots.json persistence |
-| Dynamic source management | `chats_db.py` | chats.json, /addchat at runtime |
-
----
+| Feature | File(s) |
+|---|---|
+| Real-time all-file capture | `forwarder.py` |
+| Bot-targeted capture | `bot_capture.py` |
+| Multi-account FloodWait rotation | `multi_forwarder.py`, `account_pool.py` |
+| Multi-destination routing | `router.py` |
+| Duplicate detection | `seen_db.py`, `utils.py` |
+| Caption watermark removal | `caption_cleaner.py`, `utils.py` |
+| Source auto-discovery | `discovery.py` |
+| Web dashboard | `dashboard.py` |
+| Docker support | `Dockerfile`, `docker-compose.yml` |
+| Fly.io support | `fly.toml` |
+| Render support | `render.yaml` |
+| VPS quick-setup | `setup.sh` |
+| Bulk history dump (resume-safe) | `bulk_dump.py` |
 
 ### 🔴 Remaining — Build Next
 
-#### 1. Auto-Retry Failed Forwards _(not built)_
-- Store failed message IDs in `failed.json`
-- `/retry` command re-attempts all failed forwards
-- Auto-retry on startup
-- **Implementation:** extend `tracker.py` with a `failed` dict `{chat_id: [msg_id, ...]}`
-
-#### 2. Daily Stats Report _(not built)_
-- Auto-post summary to `LOG_CHANNEL` at midnight:
-  ```
-  📊 Daily Report — 21 June 2026
-  Files forwarded: 847 | Duplicates skipped: 124 | Failed: 3
-  Top source: CineAlliance (412 files) | DEST_MOVIES: 601, DEST_SERIES: 246
-  ```
-- **Implementation:** `apscheduler` (already in main bot) + collect per-source counters in `_stats`
-
-#### 3. File Size Filter _(not built)_
-- `MIN_SIZE_MB=10` — skip corrupt tiny files under 10MB
-- `MAX_SIZE_MB=4000` — skip files over 4GB
-- **Implementation:** 4 lines in `is_allowed_file()` in `utils.py`
-
-#### 4. Quality & Language Filter _(not built)_
-- `ALLOWED_QUALITIES=1080p,4K,720p` — skip 360p/480p
-- `BLOCKED_LANGUAGES=Telugu` — exclude specific dubs by filename
-- **Implementation:** extend `is_allowed_file()` in `utils.py` with regex checks on filename
-
-#### 5. Scheduled Bulk Dump _(not built)_
-- `BULK_SCHEDULE=02:00` — run bulk dump nightly at 2 AM
-- **Implementation:** `apscheduler` + call `dump_chat()` from `bulk_dump.py`
+1. **Auto-retry failed forwards** — `failed.json` + `/retry` command in forwarder.py
+2. **File size filter** — `MIN_SIZE_MB`/`MAX_SIZE_MB` in `is_allowed_file()` (4 lines)
+3. **Quality/language filter** — `ALLOWED_QUALITIES`/`BLOCKED_LANGUAGES` regex in `is_allowed_file()`
+4. **Daily stats report** — `apscheduler` midnight post to `LOG_CHANNEL`
+5. **Scheduled bulk dump** — `apscheduler` nightly run
 
 ---
 
 ## 🤖 Agent Reference
-
-This section is for AI agents picking up this project. Read before making any changes.
 
 ### Connected Repos
 | Repo | Purpose |
@@ -536,58 +544,38 @@ This section is for AI agents picking up this project. Read before making any ch
 | [tg-file-forwarder](https://github.com/azizthekiller123/tg-file-forwarder) | This repo — feeds the main bot's index channel(s) |
 
 ### How to Push to GitHub
-Always **sequential** pushes — parallel pushes cause SHA conflicts:
+Sequential for updates (each has its own SHA), parallel for new files:
 ```bash
 SHA=$(curl -s -H "Authorization: token $GITHUB_PERSONAL_ACCESS_TOKEN" \
   "https://api.github.com/repos/azizthekiller123/tg-file-forwarder/contents/FILE" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['sha'])")
-
 CONTENT=$(base64 -w 0 local_file.py)
 curl -s -X PUT -H "Authorization: token $GITHUB_PERSONAL_ACCESS_TOKEN" \
   "https://api.github.com/repos/azizthekiller123/tg-file-forwarder/contents/FILE" \
   -d "{\"message\":\"fix: description\",\"content\":\"$CONTENT\",\"sha\":\"$SHA\"}"
 ```
 
-**Exception:** new files (not yet in the repo) can be pushed in parallel since they have no SHA.
-
-### Testing Before Pushing
-```bash
-python3 -c "
-import ast, glob
-for p in glob.glob('/tmp/fwdr/*.py'):
-    src = open(p).read()
-    try:
-        ast.parse(src)
-        if 'filters.all' in src: print(f'CRITICAL {p}: filters.all')
-        else: print(f'OK  {p}')
-    except SyntaxError as e:
-        print(f'ERR {p} line {e.lineno}: {e.msg}')
-"
-```
-
 ### Critical Rules
-1. **Library is `pyrofork==2.3.45`** — imports as `from pyrogram import ...`. Never change to `pyrofork`.
+1. **Library is `pyrofork==2.3.45`** — imports as `from pyrogram import ...`. Never rename to pyrofork.
 2. **`filters.all` does not exist** in pyrofork — use `filters.document | filters.video | filters.audio`.
-3. **`safe_forward()` in `utils.py`** must always be used — it handles FloodWait, dedup, and caption cleaning in one call.
-4. **Never commit `SESSION_STRING`** — Railway env var only.
-5. **Push files sequentially** for updates; new files can be pushed in parallel.
-6. **`get_bot_by_chat_id()`** in `bots_db.py` — always use this (not `get_bot()`) inside message handlers where you have a numeric chat ID.
-7. **`forwarder.py` and `bot_capture.py` can overlap** — if a group is in both `chats.json` and `bots.json`, a file may forward twice. Keep sources exclusive between the two scripts. Dedup in `seen_db.py` will catch the second attempt via `file_unique_id`.
-8. **`dashboard.py` runs as `asyncio.create_task()`** inside `forwarder.py` — NOT a separate process. It shares the same event loop.
-9. **`routing.json`, `chats.json`, `bots.json`, `seen.json`** are on Railway's ephemeral filesystem. They reset on full redeploy. For production persistence, use Railway's persistent volume or attach a database.
-10. **`CLEAN_CAPTIONS=true`** causes `message.copy()` instead of `message.forward()`. The auto-filter bot indexes by filename, not caption — this is safe. The file itself is unchanged.
-11. **New features** must add env vars to `.env.example` and document them in the Variables table above.
+3. **`safe_forward()` in `utils.py`** must always be used — handles FloodWait, dedup, and caption cleaning.
+4. **Never commit `SESSION_STRING`** — env var only.
+5. **`get_bot_by_chat_id()`** in `bots_db.py` — use inside handlers, not `get_bot()`.
+6. **`forwarder.py` and `bot_capture.py` can overlap** — `seen_db.py` dedup catches the second attempt.
+7. **`dashboard.py` runs as `asyncio.create_task()`** inside `forwarder.py` — not a separate process.
+8. **Dockerfile sets data paths to `/app/data`** — always mount a volume there for persistence.
+9. **New features** must add env vars to `.env.example`, `Dockerfile` ENV section, `fly.toml` [env], and `render.yaml` envVars.
 
-### What to Build Next (Recommended Order)
-1. **Auto-retry failed** — extend `tracker.py`, add `/retry` to `forwarder.py` and `bot_capture.py`
-2. **File size filter** — 4 lines in `is_allowed_file()` in `utils.py` for `MIN_SIZE_MB`/`MAX_SIZE_MB`
-3. **Quality/language filter** — extend `is_allowed_file()` with `ALLOWED_QUALITIES`/`BLOCKED_LANGUAGES` env vars
-4. **Daily stats report** — `apscheduler` midnight task posting to `LOG_CHANNEL`
-5. **Scheduled bulk dump** — `apscheduler` nightly run of `bulk_dump.py`
+### What to Build Next
+1. **Auto-retry failed** — `tracker.py` + `/retry` command
+2. **File size filter** — 4 lines in `is_allowed_file()` in `utils.py`
+3. **Quality/language filter** — extend `is_allowed_file()` in `utils.py`
+4. **Daily stats report** — `apscheduler` midnight task
+5. **Scheduled bulk dump** — nightly `apscheduler` run
 
 ### Known Limitations
-- JSON files (`seen.json`, `chats.json`, etc.) on Railway's ephemeral disk reset on full redeploy. Use Railway's persistent storage or MongoDB to survive redeploys.
-- `seen.json` is loaded into memory on first use (`_cache` in `seen_db.py`) — if the process restarts, the cache reloads from disk automatically.
-- `forwarder.py` and `bot_capture.py` both import `utils.safe_forward` — improvements to `utils.py` benefit both scripts automatically.
-- `multi_forwarder.py` Account 1 is also the command listener (DM the same account for commands as with `forwarder.py`). Accounts 2 and 3 are forwarding-only.
-- `discovery.py` `search_public_chats()` may return limited results for newer/unverified Telegram accounts. `find_joined_sources()` (scans existing dialogs) is more reliable.
+- JSON files on Railway/Heroku ephemeral disk reset on full redeploy. Use volumes (Fly/Render/Docker) for production persistence.
+- `seen.json` is memory-cached on first load (`_cache` in `seen_db.py`) — reloads from disk on restart automatically.
+- `multi_forwarder.py` Account 1 is also the command listener — DM the same number as with `forwarder.py`.
+- `discovery.py` `search_public_chats()` returns limited results for newer Telegram accounts. `find_joined_sources()` (scans existing dialogs) is more reliable.
+- `setup.sh` uses `screen` for background processes. `tmux` or `systemd` are more robust for production VPS — see comments in setup.sh.
