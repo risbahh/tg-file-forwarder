@@ -4,6 +4,7 @@ Commands (ADMINS only) — DM the userbot:
   /addchat /removechat /listchats /fwrstatus
   /route /routes /dupstats /resetdups
   /pausefwd /resumefwd
+  /srcstats
   /discover /suggest /help
 """
 import asyncio
@@ -24,6 +25,7 @@ from router import get_destination, set_route, remove_route, list_routes, format
 from seen_db import count as seen_count, reset as seen_reset
 from caption_cleaner import is_enabled as captions_enabled
 from discovery import find_joined_sources, search_public_sources, format_results
+import stats_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,8 +48,6 @@ app = Client(
 
 # ── Stats ──────────────────────────────────────────────────────────────────
 _stats = {"forwarded": 0, "skipped_dup": 0, "failed": 0, "skipped_paused": 0}
-
-# ── Pause flag ─────────────────────────────────────────────────────────────
 _paused = False
 
 
@@ -66,7 +66,6 @@ def admin_only(func):
 async def on_new_file(client: Client, message: Message):
     global _paused
 
-    # Pause check — silently drop all files while paused
     if _paused:
         _stats["skipped_paused"] += 1
         return
@@ -97,6 +96,7 @@ async def on_new_file(client: Client, message: Message):
 
     if success:
         _stats["forwarded"] += 1
+        stats_db.record(chat_id, title)   # ← per-source stat
         logger.info(f"✅ Forwarded → {dest}  |  total: {_stats['forwarded']}")
     else:
         from utils import get_unique_id
@@ -175,10 +175,11 @@ async def cmd_status(client: Client, message: Message):
         f"👀 Watching: `{len(current)}` source chats\n\n"
         f"**Session stats:**\n"
         f"✅ Forwarded: `{_stats['forwarded']}`\n"
-        f"⏭️ Duplicates skipped: `{_stats['skipped_dup']}` ({dup_pct} of traffic)\n"
+        f"⏭️ Duplicates skipped: `{_stats['skipped_dup']}` ({dup_pct})\n"
         f"⏸️ Skipped while paused: `{_stats['skipped_paused']}`\n"
         f"❌ Failed: `{_stats['failed']}`\n"
-        f"🗂️ Seen DB total: `{seen_count():,}` unique files\n\n"
+        f"🗂️ Seen DB: `{seen_count():,}` unique files\n"
+        f"📊 All-time forwarded: `{stats_db.total():,}` files\n\n"
         f"**Routing:**\n" + list_routes() + "\n\n"
         f"**Caption cleaning:** {'✅ on' if captions_enabled() else '⛔ off'}"
     )
@@ -226,8 +227,7 @@ async def cmd_dupstats(client: Client, message: Message):
         f"**This session:**\n"
         f"✅ Forwarded: `{_stats['forwarded']}`\n"
         f"⏭️ Skipped (duplicate): `{_stats['skipped_dup']}` ({pct} of traffic)\n\n"
-        f"_Duplicate detection uses Telegram's `file_unique_id` —_\n"
-        f"_the same file in two groups is always the same ID._",
+        f"_Same file in two groups = same ID → forwarded once, skipped on repeat._",
         parse_mode="markdown"
     )
 
@@ -239,41 +239,30 @@ async def cmd_resetdups(client: Client, message: Message):
     args = message.text.split(None, 1)
     confirmed = len(args) > 1 and args[1].strip().lower() == "confirm"
     current_count = seen_count()
-
     if not confirmed:
         await message.reply(
             f"⚠️ **Reset Duplicate Memory?**\n\n"
             f"This will erase `{current_count:,}` tracked file IDs from `seen.json`.\n\n"
-            f"**What happens after reset:**\n"
-            f"• The bot forgets every file it has ever forwarded\n"
-            f"• If those files get reposted in source groups, they will be forwarded again\n"
-            f"• No files are deleted from Telegram — only the memory is cleared\n\n"
-            f"**To confirm, send:**\n"
-            f"`/resetdups confirm`",
+            f"• No files deleted from Telegram — only memory cleared\n"
+            f"• Re-posted files will be forwarded again after reset\n\n"
+            f"**To confirm:** `/resetdups confirm`",
             parse_mode="markdown"
         )
         return
-
     seen_reset()
     _stats["skipped_dup"] = 0
     logger.warning(f"🗑️ seen.json cleared by admin — was {current_count:,} IDs")
-
     await message.reply(
         f"✅ **Duplicate memory cleared.**\n\n"
         f"Erased `{current_count:,}` file IDs from `seen.json`.\n"
-        f"The bot will now treat all future files as new.\n\n"
         f"_Use `/dupstats` to confirm the DB is at 0._",
         parse_mode="markdown"
     )
-
     if LOG_CHANNEL:
         try:
             me = await client.get_me()
-            await client.send_message(
-                LOG_CHANNEL,
-                f"🗑️ **seen.json reset** by `{me.first_name}`\n"
-                f"Cleared `{current_count:,}` tracked file IDs."
-            )
+            await client.send_message(LOG_CHANNEL,
+                f"🗑️ **seen.json reset** by `{me.first_name}`\nCleared `{current_count:,}` IDs.")
         except Exception:
             pass
 
@@ -285,24 +274,16 @@ async def cmd_pausefwd(client: Client, message: Message):
     global _paused
     if _paused:
         await message.reply(
-            f"⏸️ Forwarding is **already paused**.\n"
-            f"Files dropped so far: `{_stats['skipped_paused']}`\n\n"
-            f"Send `/resumefwd` to resume.",
+            f"⏸️ Already paused.\nDropped so far: `{_stats['skipped_paused']}`\n\nSend `/resumefwd` to resume.",
             parse_mode="markdown"
         )
         return
-
     _paused = True
     logger.warning("⏸️ Forwarding PAUSED by admin")
-
     await message.reply(
-        "⏸️ **Forwarding paused.**\n\n"
-        "New files from source groups will be silently ignored until you resume.\n"
-        "Already-queued forwards will complete.\n\n"
-        "Send `/resumefwd` to resume.",
+        "⏸️ **Forwarding paused.**\n\nNew files will be ignored until you send `/resumefwd`.",
         parse_mode="markdown"
     )
-
     if LOG_CHANNEL:
         try:
             me = await client.get_me()
@@ -317,34 +298,53 @@ async def cmd_pausefwd(client: Client, message: Message):
 async def cmd_resumefwd(client: Client, message: Message):
     global _paused
     if not _paused:
+        await message.reply("▶️ Forwarding is already running — nothing to resume.", parse_mode="markdown")
+        return
+    dropped = _stats["skipped_paused"]
+    _paused = False
+    _stats["skipped_paused"] = 0
+    logger.info(f"▶️ Forwarding RESUMED — dropped {dropped} files while paused")
+    await message.reply(
+        f"▶️ **Forwarding resumed.**\n\nDropped while paused: `{dropped}` files",
+        parse_mode="markdown"
+    )
+    if LOG_CHANNEL:
+        try:
+            me = await client.get_me()
+            await client.send_message(LOG_CHANNEL,
+                f"▶️ Forwarding **resumed** by `{me.first_name}`\nDropped: `{dropped}` files")
+        except Exception:
+            pass
+
+
+# ── /srcstats ──────────────────────────────────────────────────────────────
+@app.on_message(filters.command("srcstats") & filters.private)
+@admin_only
+async def cmd_srcstats(client: Client, message: Message):
+    rows = stats_db.get_all()
+    grand_total = stats_db.total()
+
+    if not rows:
         await message.reply(
-            "▶️ Forwarding is **already running** — nothing to resume.",
+            "📊 No forwarding stats yet.\n_Stats are recorded per successful forward._",
             parse_mode="markdown"
         )
         return
 
-    dropped = _stats["skipped_paused"]
-    _paused = False
-    _stats["skipped_paused"] = 0
-    logger.info(f"▶️ Forwarding RESUMED by admin (dropped {dropped} files while paused)")
+    lines = ["**📊 Per-Source Forwarding Stats**\n"]
+    for i, row in enumerate(rows[:20], 1):     # cap at 20 sources
+        pct = f"{row['count']/grand_total*100:.1f}%" if grand_total else "0%"
+        last = row.get("last_seen", "")[:10]   # YYYY-MM-DD
+        lines.append(
+            f"{i}. **{row['title']}**\n"
+            f"   `{row['count']:,}` files forwarded ({pct}) — last: {last}"
+        )
 
-    await message.reply(
-        f"▶️ **Forwarding resumed.**\n\n"
-        f"Files dropped while paused: `{dropped}`\n"
-        f"_(Those files were not forwarded — they are gone unless reposted in source groups)_",
-        parse_mode="markdown"
-    )
+    lines.append(f"\n**Total (all-time):** `{grand_total:,}` files")
+    if len(rows) > 20:
+        lines.append(f"_...and {len(rows)-20} more sources_")
 
-    if LOG_CHANNEL:
-        try:
-            me = await client.get_me()
-            await client.send_message(
-                LOG_CHANNEL,
-                f"▶️ Forwarding **resumed** by `{me.first_name}`\n"
-                f"Dropped while paused: `{dropped}` files"
-            )
-        except Exception:
-            pass
+    await message.reply("\n".join(lines), parse_mode="markdown")
 
 
 # ── /discover ──────────────────────────────────────────────────────────────
@@ -375,7 +375,6 @@ async def cmd_help(client: Client, message: Message):
     me = await client.get_me()
     await message.reply(
         f"**TG File Forwarder** — `{me.first_name}`\n\n"
-        "Silently forwards files from source groups to your index channel.\n\n"
         "**Source commands:**\n"
         "• `/addchat <chat>` — add a source chat\n"
         "• `/removechat <chat>` — remove a source chat\n"
@@ -386,9 +385,10 @@ async def cmd_help(client: Client, message: Message):
         "**Stats & dedup:**\n"
         "• `/fwrstatus` — full session stats\n"
         "• `/dupstats` — duplicate detection stats\n"
+        "• `/srcstats` — files forwarded per source group\n"
         "• `/resetdups` — clear duplicate memory (with confirmation)\n\n"
         "**Pause / Resume:**\n"
-        "• `/pausefwd` — pause all forwarding instantly\n"
+        "• `/pausefwd` — pause all forwarding\n"
         "• `/resumefwd` — resume forwarding\n\n"
         "**Discovery:**\n"
         "• `/discover` — scan joined groups for movie sources\n"
@@ -405,7 +405,7 @@ async def main():
 
     current = get_all_chats(SOURCE_CHATS)
     logger.info(f"👀 Watching {len(current)} source chat(s)")
-    logger.info(f"📤 Routing enabled — seen DB: {seen_count():,} unique IDs loaded")
+    logger.info(f"📤 Routing — seen DB: {seen_count():,} IDs | all-time: {stats_db.total():,} files")
     logger.info(f"✏️  Caption cleaning: {'on' if captions_enabled() else 'off'}")
 
     for src in current:
@@ -413,7 +413,7 @@ async def main():
             chat = await app.get_chat(src)
             logger.info(f"  ✅ {chat.title}")
         except (ChannelPrivate, UserNotParticipant):
-            logger.warning(f"  ⚠️  Not a member of: {src} — join first!")
+            logger.warning(f"  ⚠️  Not a member of: {src}")
         except Exception as e:
             logger.warning(f"  ⚠️  Cannot verify {src}: {e}")
 
@@ -421,30 +421,23 @@ async def main():
     try:
         from dashboard import start_dashboard
         asyncio.create_task(start_dashboard(stats_getter=lambda: _stats, port=port))
-        logger.info(f"🌐 Dashboard starting on port {port}")
+        logger.info(f"🌐 Dashboard on port {port}")
     except ImportError:
         logger.warning("dashboard.py not found — web dashboard disabled")
 
     if LOG_CHANNEL:
         try:
-            dest_info = os.environ.get("DEST_MOVIES") and "multi-channel routing" or f"→ {DEST_CHANNEL}"
-            await app.send_message(
-                LOG_CHANNEL,
-                f"✅ **Forwarder started**\n"
-                f"As: `{me.first_name}`\n"
+            dest_info = "multi-channel routing" if os.environ.get("DEST_MOVIES") else f"→ {DEST_CHANNEL}"
+            await app.send_message(LOG_CHANNEL,
+                f"✅ **Forwarder started**\nAs: `{me.first_name}`\n"
                 f"Watching `{len(current)}` chats | {dest_info}\n"
-                f"Dedup: {seen_count():,} IDs | Caption clean: {'on' if captions_enabled() else 'off'}"
-            )
+                f"Dedup: {seen_count():,} IDs | All-time: {stats_db.total():,} files")
         except Exception:
             pass
 
     logger.info("⏳ Listening for new files...")
     await idle()
-
-    logger.info(
-        f"📊 Final — Forwarded: {_stats['forwarded']} | "
-        f"Dup-skipped: {_stats['skipped_dup']} | Failed: {_stats['failed']}"
-    )
+    logger.info(f"📊 Final — Forwarded: {_stats['forwarded']} | Dup-skipped: {_stats['skipped_dup']} | Failed: {_stats['failed']}")
     await app.stop()
 
 if __name__ == "__main__":
