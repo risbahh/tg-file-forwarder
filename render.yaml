@@ -1,0 +1,35 @@
+# ── Render deploy config ───────────────────────────────────────────────────
+# One-click deploy: go to render.com → New → Blueprint → connect this repo
+# Or: Dashboard → New Worker → connect repo → Render auto-detects this file
+#
+# Set env vars in Render dashboard: API_ID, API_HASH, SESSION_STRING, etc.
+# See .env.example for all variables.
+
+services:
+  - type: worker                    # background worker (no HTTP required)
+    name: tg-file-forwarder
+    runtime: python
+    region: singapore               # close to Telegram servers
+    plan: free                      # free tier works for testing; starter for production
+    buildCommand: pip install -r requirements.txt
+    startCommand: python forwarder.py
+
+    # Persistent disk — survives deploys (keeps chats.json, seen.json etc.)
+    disk:
+      name: forwarder-data
+      mountPath: /app/data
+      sizeGB: 1
+
+    envVars:
+      - key: TRACKER_FILE
+        value: /app/data/forwarded.json
+      - key: CHATS_DB_FILE
+        value: /app/data/chats.json
+      - key: BOTS_DB_FILE
+        value: /app/data/bots.json
+      - key: SEEN_DB_FILE
+        value: /app/data/seen.json
+      - key: ROUTING_FILE
+        value: /app/data/routing.json
+      # Set these as secrets in the Render dashboard — do NOT put values here:
+      # API_ID, API_HASH, SESSION_STRING, DEST_CHANNEL, ADMINS, SOURCE_CHATS
