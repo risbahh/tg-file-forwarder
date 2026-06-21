@@ -22,7 +22,9 @@ def _load() -> set:
         return _cache
     if os.path.exists(_DB_FILE):
         try:
-            _cache = set(json.load(open(_DB_FILE)))
+            # FIX: use context manager so the file handle is always closed
+            with open(_DB_FILE) as f:
+                _cache = set(json.load(f))
             logger.info(f"seen_db: loaded {len(_cache):,} previously-forwarded IDs")
             return _cache
         except Exception:
