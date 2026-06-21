@@ -64,8 +64,18 @@ def get_destination(filename: str, source_chat=None) -> int:
     # 1. Per-source routing override
     routes = _load()
     if source_chat:
-        key = str(source_chat).lstrip("-")
-        for k in (str(source_chat), key, f"-{key}", f"-100{key}"):
+        src_str = str(source_chat)
+        bare    = src_str.lstrip("-")
+        # Build candidate lookup keys — handle both stored forms:
+        #   "-1001234567890" (full supergroup ID) or "1234567890" (bare positive ID)
+        # FIX: only append -100{bare} when source_chat does NOT already start with
+        #      "-100", so we never generate a doubly-prefixed key like -1001001234…
+        candidates = [src_str, bare]
+        if not src_str.startswith("-100"):
+            candidates.append(f"-100{bare}")
+        if not src_str.startswith("-"):
+            candidates.append(f"-{bare}")
+        for k in candidates:
             if k in routes:
                 return int(routes[k])
 
@@ -132,7 +142,9 @@ def format_type_label(filename: str) -> str:
 def _load() -> dict:
     if os.path.exists(_DB_FILE):
         try:
-            return json.load(open(_DB_FILE))
+            # FIX: use context manager so the file handle is always closed
+            with open(_DB_FILE) as f:
+                return json.load(f)
         except Exception:
             pass
     return {}
