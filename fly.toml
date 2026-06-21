@@ -1,0 +1,40 @@
+# ── Fly.io deploy config ───────────────────────────────────────────────────
+# Deploy: fly launch  (first time)
+#         fly deploy  (updates)
+# Set secrets: fly secrets set API_ID=12345678 API_HASH=abc SESSION_STRING=BQA...
+# See logs: fly logs
+# SSH in:  fly ssh console
+
+app = "tg-file-forwarder"
+primary_region = "sin"            # Singapore — close to Telegram servers
+                                  # Other options: nrt (Tokyo), lax (LA), fra (Frankfurt)
+
+[build]
+  # Uses the Dockerfile in this repo automatically
+
+[env]
+  PORT = "8080"
+  TRACKER_FILE  = "/data/forwarded.json"
+  CHATS_DB_FILE = "/data/chats.json"
+  BOTS_DB_FILE  = "/data/bots.json"
+  SEEN_DB_FILE  = "/data/seen.json"
+  ROUTING_FILE  = "/data/routing.json"
+
+# Dashboard web service
+[http_service]
+  internal_port = 8080
+  force_https   = true
+  auto_stop_machines  = false    # keep running 24/7
+  auto_start_machines = true
+  min_machines_running = 1
+
+# Persistent volume — mounts at /data, survives deploys
+[mounts]
+  source      = "forwarder_data"
+  destination = "/data"
+
+# Machine size — 256MB is plenty for a Telegram userbot
+[[vm]]
+  memory   = "256mb"
+  cpu_kind = "shared"
+  cpus     = 1
