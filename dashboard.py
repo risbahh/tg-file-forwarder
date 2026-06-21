@@ -92,7 +92,8 @@ def _uptime_str(seconds: float) -> str:
 
 def _read_json(path: str, default):
     try:
-        return json.load(open(path))
+        with open(path) as f:
+            return json.load(f)
     except Exception:
         return default
 
@@ -108,12 +109,16 @@ def _gather_stats(stats_getter=None) -> dict:
         dup_skipped = s.get("skipped_dup", 0)
         failed      = s.get("failed", 0)
 
-    seen_ids    = _read_json(os.environ.get("SEEN_DB_FILE",  "seen.json"),  [])
-    chats_cfg   = _read_json(os.environ.get("CHATS_DB_FILE", "chats.json"), {})
-    routes_cfg  = _read_json(os.environ.get("ROUTING_FILE",  "routing.json"), {})
+    seen_ids   = _read_json(os.environ.get("SEEN_DB_FILE",  "seen.json"),  [])
+    # FIX: chats.json format is {"chats": [...]} — must read the list, not .keys()
+    # Previously: chats_cfg.keys() returned ["chats"] instead of actual chat IDs
+    chats_cfg  = _read_json(os.environ.get("CHATS_DB_FILE", "chats.json"), {})
+    routes_cfg = _read_json(os.environ.get("ROUTING_FILE",  "routing.json"), {})
 
-    seed_chats  = [c.strip() for c in os.environ.get("SOURCE_CHATS", "").split(",") if c.strip()]
-    all_chats   = list({*seed_chats, *chats_cfg.keys()})
+    seed_chats = [c.strip() for c in os.environ.get("SOURCE_CHATS", "").split(",") if c.strip()]
+    # FIX: use chats_cfg.get("chats", []) to get the actual list of chat IDs
+    dynamic_chats = [str(c) for c in chats_cfg.get("chats", [])]
+    all_chats  = list({*seed_chats, *dynamic_chats})
 
     dest_default = os.environ.get("DEST_CHANNEL", "?")
     routing_info = [
