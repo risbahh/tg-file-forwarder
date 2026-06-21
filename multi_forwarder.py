@@ -1,24 +1,13 @@
 """
 Multi-Account Forwarder — multi_forwarder.py
-─────────────────────────────────────────────
-Runs forwarder.py logic using a rotating POOL of 2–3 userbot accounts.
-When Account 1 hits FloodWait, Account 2 takes over instantly.
-Result: near-zero downtime, 2–3× effective forwarding capacity.
+Uses a rotating pool of 2–3 userbot accounts to avoid FloodWait.
 
-Setup (add to Railway Variables):
-  SESSION_STRING    = BQA...  ← Account 1 (required, already set)
-  SESSION_STRING_2  = BQA...  ← Account 2 (optional)
-  SESSION_STRING_3  = BQA...  ← Account 3 (optional)
-
-Deploy:
-  Option A — Replace forwarder.py in Procfile:
-    worker: python multi_forwarder.py
-  
-  Option B — Run alongside forwarder.py (if forwarder.py uses Account 1 only):
-    worker:  python forwarder.py
-    worker2: python multi_forwarder.py   ← uses accounts 2 + 3
-
-Commands are identical to forwarder.py — DM the userbot account.
+Commands (DM the userbot):
+  /addchat /removechat /listchats
+  /route /routes
+  /resetdups /poolstatus
+  /pausefwd /resumefwd
+  /help
 """
 import asyncio
 import logging
@@ -50,7 +39,6 @@ ADMINS = [
     if x.strip().isdigit()
 ]
 
-# ── Main (listener) client — Account 1 always, used for commands + listening ─
 _listener = Client(
     "multi_fwd_listener",
     api_id=API_ID, api_hash=API_HASH,
@@ -59,7 +47,10 @@ _listener = Client(
 _pool: AccountPool | None = None
 
 # ── Stats ─────────────────────────────────────────────────────────────────
-_stats = {"forwarded": 0, "skipped_dup": 0, "failed": 0}
+_stats = {"forwarded": 0, "skipped_dup": 0, "failed": 0, "skipped_paused": 0}
+
+# ── Pause flag ─────────────────────────────────────────────────────────────
+_paused = False
 
 
 def admin_only(func):
@@ -75,6 +66,12 @@ def admin_only(func):
 # ── File handler ──────────────────────────────────────────────────────────
 @_listener.on_message(filters.document | filters.video | filters.audio)
 async def on_new_file(client: Client, message: Message):
+    global _paused
+
+    if _paused:
+        _stats["skipped_paused"] += 1
+        return
+
     current_chats = get_all_chats(SOURCE_CHATS)
     chat_id       = message.chat.id
     chat_username = getattr(message.chat, "username", None)
@@ -89,7 +86,6 @@ async def on_new_file(client: Client, message: Message):
     if not is_allowed_file(message, ALLOWED_TYPES):
         return
 
-    # Duplicate check
     for attr in ("document", "video", "audio"):
         obj = getattr(message, attr, None)
         if obj:
@@ -127,7 +123,7 @@ async def on_new_file(client: Client, message: Message):
         logger.error(f"❌ All accounts failed for: {name}")
 
 
-# ── Commands ──────────────────────────────────────────────────────────────
+# ── /poolstatus ────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("poolstatus") & filters.private)
 @admin_only
 async def cmd_poolstatus(client: Client, message: Message):
@@ -135,16 +131,20 @@ async def cmd_poolstatus(client: Client, message: Message):
         await message.reply("Pool not initialized yet.")
         return
     text  = await _pool.status()
+    pause_line = f"\n⏸️ **FORWARDING PAUSED** — {_stats['skipped_paused']} files dropped\n" if _paused else ""
     text += (
-        f"\n\n**Session:**\n"
+        f"\n{pause_line}"
+        f"**Session:**\n"
         f"✅ Forwarded: `{_stats['forwarded']}`\n"
         f"⏭️ Dup-skipped: `{_stats['skipped_dup']}`\n"
+        f"⏸️ Skipped while paused: `{_stats['skipped_paused']}`\n"
         f"❌ Failed: `{_stats['failed']}`\n"
         f"🗂️ Seen DB: `{seen_count():,}` unique files"
     )
     await message.reply(text, parse_mode="markdown")
 
 
+# ── /addchat ───────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("addchat") & filters.private)
 @admin_only
 async def cmd_addchat(client: Client, message: Message):
@@ -156,6 +156,7 @@ async def cmd_addchat(client: Client, message: Message):
     await message.reply(msg, parse_mode="markdown")
 
 
+# ── /removechat ────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("removechat") & filters.private)
 @admin_only
 async def cmd_removechat(client: Client, message: Message):
@@ -167,12 +168,14 @@ async def cmd_removechat(client: Client, message: Message):
     await message.reply(msg, parse_mode="markdown")
 
 
+# ── /listchats ─────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("listchats") & filters.private)
 @admin_only
 async def cmd_listchats(client: Client, message: Message):
     await message.reply(list_chats(SOURCE_CHATS), parse_mode="markdown")
 
 
+# ── /route ─────────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("route") & filters.private)
 @admin_only
 async def cmd_route(client: Client, message: Message):
@@ -180,7 +183,6 @@ async def cmd_route(client: Client, message: Message):
     if len(args) < 3:
         await message.reply(
             "**Usage:** `/route <source_chat> <dest_channel>`\n\n"
-            "**Example:** `/route CineAlliance -1001111111111`\n\n"
             + list_routes(),
             parse_mode="markdown"
         )
@@ -194,6 +196,7 @@ async def cmd_route(client: Client, message: Message):
     await message.reply(msg, parse_mode="markdown")
 
 
+# ── /routes ────────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("routes") & filters.private)
 @admin_only
 async def cmd_routes(client: Client, message: Message):
@@ -204,41 +207,29 @@ async def cmd_routes(client: Client, message: Message):
 @_listener.on_message(filters.command("resetdups") & filters.private)
 @admin_only
 async def cmd_resetdups(client: Client, message: Message):
-    """
-    Two-step confirmation to clear seen.json.
-
-    Step 1: /resetdups          → shows warning + current count
-    Step 2: /resetdups confirm  → clears the DB
-    """
     args = message.text.split(None, 1)
     confirmed = len(args) > 1 and args[1].strip().lower() == "confirm"
-
     current_count = seen_count()
 
     if not confirmed:
         await message.reply(
             f"⚠️ **Reset Duplicate Memory?**\n\n"
             f"This will erase `{current_count:,}` tracked file IDs from `seen.json`.\n\n"
-            f"**What happens after reset:**\n"
-            f"• The bot forgets every file it has ever forwarded\n"
-            f"• If those files get reposted in source groups, they will be forwarded again\n"
-            f"• No files are deleted from Telegram — only the memory is cleared\n\n"
-            f"**To confirm, send:**\n"
-            f"`/resetdups confirm`",
+            f"• No files deleted from Telegram — only memory is cleared\n"
+            f"• Re-posted files will be forwarded again after reset\n\n"
+            f"**To confirm:** `/resetdups confirm`",
             parse_mode="markdown"
         )
         return
 
-    # Confirmed — perform the reset
     seen_reset()
     _stats["skipped_dup"] = 0
     logger.warning(f"🗑️ seen.json cleared by admin — was {current_count:,} IDs")
 
     await message.reply(
         f"✅ **Duplicate memory cleared.**\n\n"
-        f"Erased `{current_count:,}` file IDs from `seen.json`.\n"
-        f"The bot will now treat all future files as new.\n\n"
-        f"_Use `/poolstatus` to confirm the DB is at 0._",
+        f"Erased `{current_count:,}` file IDs.\n"
+        f"_Use `/poolstatus` to confirm DB is at 0._",
         parse_mode="markdown"
     )
 
@@ -254,20 +245,87 @@ async def cmd_resetdups(client: Client, message: Message):
             pass
 
 
+# ── /pausefwd ──────────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("pausefwd") & filters.private)
+@admin_only
+async def cmd_pausefwd(client: Client, message: Message):
+    global _paused
+    if _paused:
+        await message.reply(
+            f"⏸️ Forwarding is **already paused**.\n"
+            f"Files dropped so far: `{_stats['skipped_paused']}`\n\n"
+            f"Send `/resumefwd` to resume.",
+            parse_mode="markdown"
+        )
+        return
+
+    _paused = True
+    logger.warning("⏸️ Forwarding PAUSED by admin")
+
+    await message.reply(
+        "⏸️ **Forwarding paused.**\n\n"
+        "New files from source groups will be silently ignored.\n\n"
+        "Send `/resumefwd` to resume.",
+        parse_mode="markdown"
+    )
+
+    if LOG_CHANNEL:
+        try:
+            me = await client.get_me()
+            await client.send_message(LOG_CHANNEL, f"⏸️ Forwarding **paused** by `{me.first_name}`")
+        except Exception:
+            pass
+
+
+# ── /resumefwd ─────────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("resumefwd") & filters.private)
+@admin_only
+async def cmd_resumefwd(client: Client, message: Message):
+    global _paused
+    if not _paused:
+        await message.reply(
+            "▶️ Forwarding is **already running** — nothing to resume.",
+            parse_mode="markdown"
+        )
+        return
+
+    dropped = _stats["skipped_paused"]
+    _paused = False
+    _stats["skipped_paused"] = 0
+    logger.info(f"▶️ Forwarding RESUMED by admin (dropped {dropped} files while paused)")
+
+    await message.reply(
+        f"▶️ **Forwarding resumed.**\n\n"
+        f"Files dropped while paused: `{dropped}`\n"
+        f"_(Those files were not forwarded — only new ones from now on)_",
+        parse_mode="markdown"
+    )
+
+    if LOG_CHANNEL:
+        try:
+            me = await client.get_me()
+            await client.send_message(
+                LOG_CHANNEL,
+                f"▶️ Forwarding **resumed** by `{me.first_name}`\n"
+                f"Dropped while paused: `{dropped}` files"
+            )
+        except Exception:
+            pass
+
+
+# ── /help ─────────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command(["start", "help"]) & filters.private)
 async def cmd_help(client: Client, message: Message):
     me = await client.get_me()
     await message.reply(
         f"**Multi-Account Forwarder** — `{me.first_name}`\n\n"
-        "Same as forwarder.py but uses a pool of accounts to avoid FloodWait.\n\n"
         "**Commands:**\n"
-        "• `/addchat <chat>` — add source\n"
-        "• `/removechat <chat>` — remove source\n"
-        "• `/listchats` — list sources\n"
-        "• `/route <src> <dest>` — set routing rule\n"
-        "• `/routes` — show all routing rules\n"
-        "• `/resetdups` — clear duplicate memory (with confirmation)\n"
-        "• `/poolstatus` — account pool stats\n",
+        "• `/addchat` / `/removechat` / `/listchats`\n"
+        "• `/route <src> <dest>` / `/routes`\n"
+        "• `/resetdups` — clear duplicate memory\n"
+        "• `/pausefwd` — pause all forwarding\n"
+        "• `/resumefwd` — resume forwarding\n"
+        "• `/poolstatus` — account pool + session stats\n",
         parse_mode="markdown"
     )
 
@@ -293,8 +351,7 @@ async def main():
                 f"🏊 **Multi-account forwarder started**\n"
                 f"Listener: `{me.first_name}`\n"
                 f"Pool: {_pool.account_count()} account(s)\n"
-                f"Sources: {len(current)}\n"
-                f"Routing: {'DEST_MOVIES/SERIES/SOUTH' if os.environ.get('DEST_MOVIES') else 'single channel'}"
+                f"Sources: {len(current)}"
             )
         except Exception:
             pass
