@@ -88,7 +88,7 @@ A **userbot** (regular Telegram account running as a script) that:
 ### File Structure
 ```
 tg-file-forwarder/
-├── forwarder.py        # Real-time watcher + /addchat /removechat /listchats commands
+├── forwarder.py        # Real-time watcher + all admin commands
 ├── multi_forwarder.py  # Same but rotates 2–3 accounts to avoid FloodWait
 ├── bot_capture.py      # Captures ONLY files from a specific registered bot per group
 ├── bulk_dump.py        # One-time historical dump with resume (forwarded.json)
@@ -117,7 +117,7 @@ tg-file-forwarder/
 | `API_HASH` | ✅ | From my.telegram.org |
 | `SESSION_STRING` | ✅ | Run session_gen.py locally once |
 | `DEST_CHANNEL` | ✅ | Main bot's index channel ID (negative int) |
-| `SOURCE_CHATS` | ⚡ | Comma-separated usernames/IDs — NOW OPTIONAL (can use /addchat only) |
+| `SOURCE_CHATS` | ⚡ | Comma-separated usernames/IDs — OPTIONAL (can use /addchat only) |
 | `ADMINS` | ⚡ | Your Telegram user ID — who can use commands |
 | `DELAY` | ⚡ | Seconds between forwards (default: 3) |
 | `ALLOWED_TYPES` | ⚡ | document,video (default) |
@@ -139,6 +139,7 @@ tg-file-forwarder/
 | `/route <src> <channel>` | Override destination for a specific source group |
 | `/routes` | Show all routing rules |
 | `/dupstats` | Duplicate detection stats |
+| `/resetdups` | Show warning + count → `/resetdups confirm` to clear seen.json |
 | `/discover` | Scan joined groups for movie sources |
 | `/suggest <keyword>` | Search Telegram for public groups |
 | `/poolstatus` | (multi_forwarder.py) Pool account status |
@@ -147,11 +148,17 @@ tg-file-forwarder/
 | `/listbots` | (bot_capture.py) List all bot-group registrations |
 | `/capturestatus` | (bot_capture.py) Live capture stats |
 
+### How /resetdups Works
+- **Step 1:** `/resetdups` → bot replies with current ID count and a warning explaining what reset means
+- **Step 2:** `/resetdups confirm` → clears `seen.json`, resets session dup counter to 0, logs to LOG_CHANNEL
+- Does NOT delete any files from Telegram — only erases the bot's memory of what it forwarded
+- Use when: switching index channels, seen.json corruption, or intentional re-forward from scratch
+
 ### How caption_cleaner.py Works
 - Enabled by default (`CLEAN_CAPTIONS=true`)
 - Strips: @mentions, t.me links, http URLs, [bracketed tags], "Powered by" lines
-- When all caption content is stripped → returns `None` → forwarded with empty caption
-- Used in `utils.safe_forward()` via `message.copy(dest, caption=cleaned or "")`
+- When all caption content stripped → returns `None` → forwarded with `caption=""` (empty, not original)
+- Used in `utils.safe_forward()` via `message.copy(dest, caption=cleaned if cleaned is not None else "")`
 
 ### How router.py Works
 - Reads `routing.json` for per-source overrides (set via `/route`)
@@ -162,6 +169,7 @@ tg-file-forwarder/
 - In-memory `set` + `seen.json` on disk
 - Keyed by `file_unique_id` — Telegram's globally unique file fingerprint
 - Same file in two different groups = same `file_unique_id` → forwarded once, skipped on repeat
+- `reset()` clears both in-memory cache and disk file
 
 ### How account_pool.py Works
 - `AccountPool.create()` loads `SESSION_STRING`, `SESSION_STRING_2`, `SESSION_STRING_3`
@@ -172,22 +180,28 @@ tg-file-forwarder/
 
 ---
 
-## 🐛 All Bugs Fixed in Session 5 — 7 Total (tg-file-forwarder)
+## 🐛 All Bugs Fixed in Session 5 — 7 Bugs + 1 Feature
 
+### Bug Fixes
 | File | Bug | Severity | Fix Applied |
 |---|---|---|---|
 | `dashboard.py` | `chats_cfg.keys()` returns `["chats"]` not actual chat IDs — dashboard showed wrong source count | 🔴 Critical | Changed to `chats_cfg.get("chats", [])` |
 | `utils.py` | `caption=None` passed to `message.copy()` — pyrofork keeps original caption, watermarks NOT removed | 🔴 Critical | Changed to `caption=cleaned if cleaned is not None else ""` |
 | `config.py` | `SOURCE_CHATS` was `_require()` (mandatory) — startup crash if not set, even when using /addchat only | 🔴 Critical | Made optional with empty list default |
 | `multi_forwarder.py` | `/route` cmd did `int(args[2].strip())` with no try/except — unhandled crash on bad input | 🟡 Medium | Added `try/except ValueError` with user-friendly error reply |
-| `account_pool.py` | `forward_messages()` raised `ChatForwardsRestricted` on protected channels — no fallback, silently failed | 🟡 Medium | Added fallback to `copy_message()` when `ChatForwardsRestricted` is raised |
-| `router.py` | `f"-100{key}"` generated wrong key when source_chat already had `-100` prefix (e.g. `-1001234` → `-1001001234`) | 🟡 Medium | Fixed: only append `-100{bare}` when source_chat does NOT already start with `-100` |
-| `seen_db.py` + `router.py` | `open(file)` without `with` statement — file handles never explicitly closed | 🟢 Minor | Changed to `with open(file) as f:` context managers |
+| `account_pool.py` | `ChatForwardsRestricted` from protected channels had no fallback — silently failed | 🟡 Medium | Added fallback to `copy_message()` when `ChatForwardsRestricted` is raised |
+| `router.py` | `f"-100{key}"` generated wrong key when source_chat already had `-100` prefix | 🟡 Medium | Fixed: only append `-100{bare}` when source_chat does NOT start with `-100` |
+| `seen_db.py` + `router.py` | `open()` without `with` — file handles never closed | 🟢 Minor | Changed to `with open(file) as f:` context managers |
 
-**Previously fixed (Session 4):**
+### Feature Added
+| File | Feature |
+|---|---|
+| `forwarder.py` + `multi_forwarder.py` | `/resetdups` — two-step confirmation to clear seen.json; step 1 shows count + warning, step 2 (`/resetdups confirm`) performs the reset and notifies LOG_CHANNEL |
+
+### Previously fixed (Session 4)
 | File | Bug | Fix |
 |---|---|---|
-| `forwarder.py` | `filters.all` doesn't exist in pyrofork → AttributeError crash at startup | Removed `filters.all &` — file type filters alone are sufficient |
+| `forwarder.py` | `filters.all` doesn't exist in pyrofork → AttributeError crash at startup | Removed `filters.all &` |
 
 ---
 
@@ -196,13 +210,11 @@ tg-file-forwarder/
 ### Pushing to GitHub
 Always use GitHub API with `$GITHUB_PERSONAL_ACCESS_TOKEN`:
 ```bash
-# Get file SHA first (for updates)
 SHA=$(curl -s -H "Authorization: Bearer $GITHUB_PERSONAL_ACCESS_TOKEN" \
   -H "User-Agent: replit-agent" \
   "https://api.github.com/repos/azizthekiller123/REPO/contents/FILE" \
   | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const j=JSON.parse(d);console.log(j.sha);})")
 
-# Push update
 curl -s -X PUT \
   -H "Authorization: Bearer $GITHUB_PERSONAL_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
@@ -212,7 +224,7 @@ curl -s -X PUT \
 ```
 - Push files **sequentially** (not parallel) — parallel pushes cause SHA conflicts
 - Railway auto-deploys on every push to main (~2 min)
-- python3 is not available — use `node -e` for JSON parsing in bash
+- `python3` is not available in the Replit sandbox — use `node -e` for JSON parsing
 
 ### Verifying Bot is Live
 ```bash
@@ -224,8 +236,8 @@ curl https://web-production-ef06e.up.railway.app/ping
 1. Add `/health` route to `route.py` in the **main bot** (`Auto-filter-bot-4`) with real DB status check
 2. Add referral/invite tracking system to main bot
 3. Add `/addchat` `/removechat` to main bot for managing index channels dynamically
-4. Add `/resetdups` command to forwarder to clear `seen.json` with confirmation prompt
-5. Add per-source forwarding stats (how many files forwarded from each group)
+4. Add per-source forwarding stats (how many files forwarded per group — stored in a stats.json)
+5. Add `/pausefwd` / `/resumefwd` commands to temporarily pause forwarding without restart
 
 ---
 
@@ -238,6 +250,6 @@ curl https://web-production-ef06e.up.railway.app/ping
 5. **ALWAYS** wrap `.remove()` calls on `temp.BANNED_USERS` / `temp.BANNED_CHATS` in `try/except ValueError: pass`
 6. **ALWAYS** use `group=-1` for new callback handlers added to main bot
 7. `/ban` and `/unban` are ONLY in `admin_features.py` — never add elsewhere
-8. **python3** is not available in the Replit sandbox — use `node -e` for JSON parsing in bash scripts
-9. **SOURCE_CHATS** is now optional in config.py — no need to set if using /addchat only
+8. `python3` is not available in the Replit sandbox — use `node -e` for JSON parsing in bash
+9. `SOURCE_CHATS` is now optional in config.py — no crash if not set (uses /addchat instead)
 10. Bot health check URL: `https://web-production-ef06e.up.railway.app/ping`
