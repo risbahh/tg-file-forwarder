@@ -35,7 +35,7 @@ from config import (
 from utils import is_allowed_file, get_file_name, get_file_size, human_size
 from chats_db import get_all_chats, add_chat, remove_chat, list_chats
 from router import get_destination, set_route, remove_route, list_routes, format_type_label
-from seen_db import is_seen, mark_seen, count as seen_count
+from seen_db import is_seen, mark_seen, count as seen_count, reset as seen_reset
 from account_pool import AccountPool
 
 logging.basicConfig(
@@ -185,7 +185,6 @@ async def cmd_route(client: Client, message: Message):
             parse_mode="markdown"
         )
         return
-    # FIX: wrap int() conversion in try/except — crashes without it on bad input
     try:
         dest_int = int(args[2].strip())
     except ValueError:
@@ -201,6 +200,60 @@ async def cmd_routes(client: Client, message: Message):
     await message.reply(list_routes(), parse_mode="markdown")
 
 
+# ── /resetdups ─────────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("resetdups") & filters.private)
+@admin_only
+async def cmd_resetdups(client: Client, message: Message):
+    """
+    Two-step confirmation to clear seen.json.
+
+    Step 1: /resetdups          → shows warning + current count
+    Step 2: /resetdups confirm  → clears the DB
+    """
+    args = message.text.split(None, 1)
+    confirmed = len(args) > 1 and args[1].strip().lower() == "confirm"
+
+    current_count = seen_count()
+
+    if not confirmed:
+        await message.reply(
+            f"⚠️ **Reset Duplicate Memory?**\n\n"
+            f"This will erase `{current_count:,}` tracked file IDs from `seen.json`.\n\n"
+            f"**What happens after reset:**\n"
+            f"• The bot forgets every file it has ever forwarded\n"
+            f"• If those files get reposted in source groups, they will be forwarded again\n"
+            f"• No files are deleted from Telegram — only the memory is cleared\n\n"
+            f"**To confirm, send:**\n"
+            f"`/resetdups confirm`",
+            parse_mode="markdown"
+        )
+        return
+
+    # Confirmed — perform the reset
+    seen_reset()
+    _stats["skipped_dup"] = 0
+    logger.warning(f"🗑️ seen.json cleared by admin — was {current_count:,} IDs")
+
+    await message.reply(
+        f"✅ **Duplicate memory cleared.**\n\n"
+        f"Erased `{current_count:,}` file IDs from `seen.json`.\n"
+        f"The bot will now treat all future files as new.\n\n"
+        f"_Use `/poolstatus` to confirm the DB is at 0._",
+        parse_mode="markdown"
+    )
+
+    if LOG_CHANNEL:
+        try:
+            me = await client.get_me()
+            await client.send_message(
+                LOG_CHANNEL,
+                f"🗑️ **seen.json reset** by `{me.first_name}`\n"
+                f"Cleared `{current_count:,}` tracked file IDs."
+            )
+        except Exception:
+            pass
+
+
 @_listener.on_message(filters.command(["start", "help"]) & filters.private)
 async def cmd_help(client: Client, message: Message):
     me = await client.get_me()
@@ -213,6 +266,7 @@ async def cmd_help(client: Client, message: Message):
         "• `/listchats` — list sources\n"
         "• `/route <src> <dest>` — set routing rule\n"
         "• `/routes` — show all routing rules\n"
+        "• `/resetdups` — clear duplicate memory (with confirmation)\n"
         "• `/poolstatus` — account pool stats\n",
         parse_mode="markdown"
     )
