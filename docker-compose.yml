@@ -1,0 +1,51 @@
+# ── TG File Forwarder — docker-compose.yml ────────────────────────────────
+# Local development and self-hosted VPS setup.
+#
+# Setup:
+#   1. cp .env.example .env  → fill in your values
+#   2. docker compose up -d  → builds and starts in background
+#   3. docker compose logs -f → watch live logs
+#   4. Visit http://localhost:8080 for the dashboard
+#
+# To run bot_capture.py instead:
+#   Change command: python bot_capture.py
+#
+# To run BOTH (forwarder + bot_capture) at the same time:
+#   Uncomment the bot_capture service below.
+# ─────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+  forwarder:
+    build: .
+    container_name: tg_forwarder
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - PORT=8080
+      - TRACKER_FILE=/app/data/forwarded.json
+      - CHATS_DB_FILE=/app/data/chats.json
+      - BOTS_DB_FILE=/app/data/bots.json
+      - SEEN_DB_FILE=/app/data/seen.json
+      - ROUTING_FILE=/app/data/routing.json
+    volumes:
+      - forwarder_data:/app/data    # persistent: survives container restarts
+    ports:
+      - "8080:8080"                 # dashboard at http://localhost:8080
+    command: python forwarder.py
+
+  # ── Uncomment to also run bot_capture.py ──────────────────────────────
+  # bot_capture:
+  #   build: .
+  #   container_name: tg_bot_capture
+  #   restart: unless-stopped
+  #   env_file: .env
+  #   volumes:
+  #     - forwarder_data:/app/data  # shares same data volume
+  #   command: python bot_capture.py
+
+volumes:
+  forwarder_data:
+    # Named volume: data persists across `docker compose down/up`
+    # To wipe: docker volume rm tg-file-forwarder_forwarder_data
