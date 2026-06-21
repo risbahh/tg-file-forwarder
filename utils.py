@@ -54,7 +54,9 @@ async def safe_forward(
         try:
             if use_copy:
                 cleaned = strip_watermarks(message.caption)
-                await message.copy(dest, caption=cleaned)
+                # FIX: pass "" (not None) so pyrofork actually clears the caption
+                # when the cleaner strips everything. Passing None keeps the original.
+                await message.copy(dest, caption=cleaned if cleaned is not None else "")
             else:
                 await message.forward(dest)
             await asyncio.sleep(DELAY)
