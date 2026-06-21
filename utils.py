@@ -1,12 +1,11 @@
 """
 Shared utilities — utils.py
 ────────────────────────────
-Used by forwarder.py, bot_capture.py, and multi_forwarder.py.
-
-safe_forward() is the single point of entry for all forwarding:
-  • FloodWait retry with exponential backoff
-  • Duplicate detection via seen_db (file_unique_id)
-  • Caption watermark stripping via caption_cleaner
+safe_forward() is the single forwarding entry point:
+  • Duplicate detection  (seen_db file_unique_id)
+  • Caption watermark stripping  (caption_cleaner)
+  • Caption suffix appending     (caption_suffix)
+  • FloodWait retry with backoff
 """
 import asyncio
 import logging
@@ -25,43 +24,49 @@ async def safe_forward(
     clean_captions: bool  = True,
 ) -> bool:
     """
-    Forward a single message with:
-      • FloodWait handling + retries
-      • Duplicate detection  (skip_duplicates=True by default)
-      • Caption watermark removal  (clean_captions=True by default)
-
+    Forward a single message.
     Returns True on success, False on duplicate-skip or max-retries.
     """
     # ── 1. Duplicate check ─────────────────────────────────────────────────
     if skip_duplicates:
         uid = get_unique_id(message)
         if uid:
-            from seen_db import is_seen, mark_seen
+            from seen_db import is_seen
             if is_seen(uid):
                 logger.debug(f"⏭️  Duplicate skipped: {uid[:12]}…")
                 return False
 
-    # ── 2. Forward (with optional caption cleaning) ─────────────────────────
+    # ── 2. Build cleaned caption ───────────────────────────────────────────
     from caption_cleaner import clean as strip_watermarks, is_enabled as captions_on
 
-    use_copy = clean_captions and captions_on() and bool(
-        message.caption or (
-            getattr(message.document, "file_name", None) and message.caption
-        )
-    )
+    use_copy = clean_captions and captions_on()
 
+    def _build_caption(original: str | None) -> str:
+        """Apply watermark stripping + custom suffix."""
+        cleaned = strip_watermarks(original) if (clean_captions and captions_on()) else original
+        # Append suffix (if set)
+        try:
+            from caption_suffix import get as get_suffix
+            suffix = get_suffix()
+        except ImportError:
+            suffix = ""
+        if suffix:
+            if cleaned:
+                return cleaned + "\n\n" + suffix
+            return suffix
+        return cleaned if cleaned is not None else ""
+
+    # ── 3. Forward with retry ──────────────────────────────────────────────
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if use_copy:
-                cleaned = strip_watermarks(message.caption)
-                # FIX: pass "" (not None) so pyrofork actually clears the caption
-                # when the cleaner strips everything. Passing None keeps the original.
-                await message.copy(dest, caption=cleaned if cleaned is not None else "")
+                caption_out = _build_caption(message.caption)
+                await message.copy(dest, caption=caption_out)
             else:
                 await message.forward(dest)
             await asyncio.sleep(DELAY)
 
-            # ── 3. Mark as seen after successful forward ──────────────────
+            # Mark as seen after success
             if skip_duplicates:
                 uid = get_unique_id(message)
                 if uid:
@@ -82,7 +87,6 @@ async def safe_forward(
 
 
 def get_unique_id(message: Message) -> str | None:
-    """Extract file_unique_id from any supported message type."""
     for attr in ("document", "video", "audio", "photo"):
         obj = getattr(message, attr, None)
         if obj:
@@ -93,7 +97,6 @@ def get_unique_id(message: Message) -> str | None:
 
 
 def is_allowed_file(message: Message, allowed_types: list) -> bool:
-    """Return True if the message contains a file type we want to forward."""
     checks = {
         "document": bool(message.document),
         "video":    bool(message.video),
@@ -104,7 +107,6 @@ def is_allowed_file(message: Message, allowed_types: list) -> bool:
 
 
 def get_file_name(message: Message) -> str:
-    """Extract a human-readable filename from a message."""
     for attr in ("document", "video", "audio"):
         obj = getattr(message, attr, None)
         if obj and getattr(obj, "file_name", None):
@@ -113,7 +115,6 @@ def get_file_name(message: Message) -> str:
 
 
 def get_file_size(message: Message) -> int:
-    """Return file size in bytes, or 0 if unavailable."""
     for attr in ("document", "video", "audio"):
         obj = getattr(message, attr, None)
         if obj:
