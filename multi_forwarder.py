@@ -185,7 +185,13 @@ async def cmd_route(client: Client, message: Message):
             parse_mode="markdown"
         )
         return
-    msg = set_route(args[1].strip(), int(args[2].strip()))
+    # FIX: wrap int() conversion in try/except — crashes without it on bad input
+    try:
+        dest_int = int(args[2].strip())
+    except ValueError:
+        await message.reply("❌ Destination must be a channel ID (negative integer).", parse_mode="markdown")
+        return
+    msg = set_route(args[1].strip(), dest_int)
     await message.reply(msg, parse_mode="markdown")
 
 
