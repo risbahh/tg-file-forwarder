@@ -1,9 +1,9 @@
 """
 Multi-Account Forwarder — multi_forwarder.py
-Rotates 2–3 userbot accounts to avoid FloodWait.
-
 Commands: /addchat /removechat /listchats /route /routes
-          /resetdups /pausefwd /resumefwd /srcstats /poolstatus /help
+          /resetdups /pausefwd /resumefwd /srcstats
+          /setcaption /strippatterns /cleancaptions /stopcleaning
+          /poolstatus /help
 """
 import asyncio
 import logging
@@ -11,7 +11,10 @@ import os
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pyrogram.errors import ChannelPrivate, UserNotParticipant
+from pyrogram.errors import (
+    ChannelPrivate, UserNotParticipant,
+    SessionRevoked, AuthKeyUnregistered, UserDeactivated,
+)
 
 from config import (
     API_ID, API_HASH, SESSION_STRING,
@@ -23,6 +26,8 @@ from router import get_destination, set_route, remove_route, list_routes, format
 from seen_db import is_seen, mark_seen, count as seen_count, reset as seen_reset
 from account_pool import AccountPool
 import stats_db
+import strip_patterns as sp_db
+import caption_suffix as cs_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,9 +47,10 @@ _listener = Client(
     session_string=SESSION_STRING,
 )
 _pool: AccountPool | None = None
-
 _stats  = {"forwarded": 0, "skipped_dup": 0, "failed": 0, "skipped_paused": 0}
 _paused = False
+_cleaning_task: asyncio.Task | None = None
+_stop_cleaning  = False
 
 
 def admin_only(func):
@@ -57,11 +63,35 @@ def admin_only(func):
     return wrapper
 
 
+# ── Session watchdog ───────────────────────────────────────────────────────
+async def _session_watchdog():
+    await asyncio.sleep(60)
+    while True:
+        await asyncio.sleep(300)
+        try:
+            await _listener.get_me()
+        except (SessionRevoked, AuthKeyUnregistered, UserDeactivated) as e:
+            alert = (
+                f"⚠️ **Session Revoked!**\n\nError: `{type(e).__name__}`\n\n"
+                f"The forwarder has stopped. Regenerate SESSION_STRING and redeploy."
+            )
+            logger.critical(f"🔴 SESSION REVOKED: {e}")
+            if LOG_CHANNEL:
+                try: await _listener.send_message(LOG_CHANNEL, alert)
+                except Exception: pass
+            for uid in ADMINS:
+                try: await _listener.send_message(uid, alert)
+                except Exception: pass
+            await asyncio.sleep(5)
+            os._exit(1)
+        except Exception:
+            pass
+
+
 # ── File handler ──────────────────────────────────────────────────────────
 @_listener.on_message(filters.document | filters.video | filters.audio)
 async def on_new_file(client: Client, message: Message):
     global _paused
-
     if _paused:
         _stats["skipped_paused"] += 1
         return
@@ -96,7 +126,6 @@ async def on_new_file(client: Client, message: Message):
     title = getattr(message.chat, "title", str(chat_id))
 
     logger.info(f"📥 [{title}] {label} {name} ({size}) → {dest}")
-
     ok = await _pool.forward(message, dest) if _pool else False
 
     if ok:
@@ -104,11 +133,10 @@ async def on_new_file(client: Client, message: Message):
             obj = getattr(message, attr, None)
             if obj:
                 uid = getattr(obj, "file_unique_id", None)
-                if uid:
-                    mark_seen(uid)
+                if uid: mark_seen(uid)
                 break
         _stats["forwarded"] += 1
-        stats_db.record(chat_id, title)   # ← per-source stat
+        stats_db.record(chat_id, title)
         logger.info(f"✅ Forwarded → {dest}  |  total: {_stats['forwarded']}")
     else:
         _stats["failed"] += 1
@@ -122,22 +150,24 @@ async def cmd_poolstatus(client: Client, message: Message):
     if not _pool:
         await message.reply("Pool not initialized yet.")
         return
-    text  = await _pool.status()
+    text = await _pool.status()
     pause_line = f"\n⏸️ **PAUSED** — {_stats['skipped_paused']} dropped\n" if _paused else ""
+    suffix = cs_db.get()
     text += (
         f"\n{pause_line}"
-        f"**Session:**\n"
         f"✅ Forwarded: `{_stats['forwarded']}`\n"
         f"⏭️ Dup-skipped: `{_stats['skipped_dup']}`\n"
         f"⏸️ Paused-dropped: `{_stats['skipped_paused']}`\n"
         f"❌ Failed: `{_stats['failed']}`\n"
-        f"🗂️ Seen DB: `{seen_count():,}` unique files\n"
-        f"📊 All-time: `{stats_db.total():,}` files"
+        f"🗂️ Seen DB: `{seen_count():,}`\n"
+        f"📊 All-time: `{stats_db.total():,}` files\n"
+        f"**Suffix:** " + (f"`{suffix}`" if suffix else "_not set_") + "\n"
+        f"**Patterns:** `{sp_db.count()}`"
     )
     await message.reply(text, parse_mode="markdown")
 
 
-# ── /addchat ───────────────────────────────────────────────────────────────
+# ── Source commands ────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("addchat") & filters.private)
 @admin_only
 async def cmd_addchat(client: Client, message: Message):
@@ -149,7 +179,6 @@ async def cmd_addchat(client: Client, message: Message):
     await message.reply(msg, parse_mode="markdown")
 
 
-# ── /removechat ────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("removechat") & filters.private)
 @admin_only
 async def cmd_removechat(client: Client, message: Message):
@@ -161,146 +190,245 @@ async def cmd_removechat(client: Client, message: Message):
     await message.reply(msg, parse_mode="markdown")
 
 
-# ── /listchats ─────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("listchats") & filters.private)
 @admin_only
 async def cmd_listchats(client: Client, message: Message):
     await message.reply(list_chats(SOURCE_CHATS), parse_mode="markdown")
 
 
-# ── /route ─────────────────────────────────────────────────────────────────
+# ── Routing ────────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("route") & filters.private)
 @admin_only
 async def cmd_route(client: Client, message: Message):
     args = message.text.split(None, 2)
     if len(args) < 3:
-        await message.reply(
-            "**Usage:** `/route <source_chat> <dest_channel>`\n\n" + list_routes(),
-            parse_mode="markdown"
-        )
+        await message.reply("**Usage:** `/route <source_chat> <dest_channel>`\n\n" + list_routes(), parse_mode="markdown")
         return
     try:
         dest_int = int(args[2].strip())
     except ValueError:
         await message.reply("❌ Destination must be a channel ID (negative integer).", parse_mode="markdown")
         return
-    msg = set_route(args[1].strip(), dest_int)
-    await message.reply(msg, parse_mode="markdown")
+    await message.reply(set_route(args[1].strip(), dest_int), parse_mode="markdown")
 
 
-# ── /routes ────────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("routes") & filters.private)
 @admin_only
 async def cmd_routes(client: Client, message: Message):
     await message.reply(list_routes(), parse_mode="markdown")
 
 
-# ── /resetdups ─────────────────────────────────────────────────────────────
+# ── /resetdups /srcstats ───────────────────────────────────────────────────
 @_listener.on_message(filters.command("resetdups") & filters.private)
 @admin_only
 async def cmd_resetdups(client: Client, message: Message):
     args = message.text.split(None, 1)
     confirmed = len(args) > 1 and args[1].strip().lower() == "confirm"
-    current_count = seen_count()
+    n = seen_count()
     if not confirmed:
-        await message.reply(
-            f"⚠️ **Reset Duplicate Memory?**\n\n"
-            f"Will erase `{current_count:,}` tracked IDs from `seen.json`.\n\n"
-            f"**To confirm:** `/resetdups confirm`",
-            parse_mode="markdown"
-        )
+        await message.reply(f"⚠️ Will erase `{n:,}` tracked IDs.\nNo files deleted — only memory.\n\n**To confirm:** `/resetdups confirm`", parse_mode="markdown")
         return
     seen_reset()
     _stats["skipped_dup"] = 0
-    logger.warning(f"🗑️ seen.json cleared — was {current_count:,} IDs")
-    await message.reply(
-        f"✅ **Duplicate memory cleared.**\nErased `{current_count:,}` file IDs.",
-        parse_mode="markdown"
-    )
-    if LOG_CHANNEL:
-        try:
-            me = await client.get_me()
-            await client.send_message(LOG_CHANNEL,
-                f"🗑️ **seen.json reset** by `{me.first_name}`\nCleared `{current_count:,}` IDs.")
-        except Exception:
-            pass
+    await message.reply(f"✅ Cleared `{n:,}` file IDs.", parse_mode="markdown")
 
 
-# ── /pausefwd ──────────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("srcstats") & filters.private)
+@admin_only
+async def cmd_srcstats(client: Client, message: Message):
+    rows  = stats_db.get_all()
+    grand = stats_db.total()
+    if not rows:
+        await message.reply("📊 No forwarding stats yet.", parse_mode="markdown")
+        return
+    lines = ["**📊 Per-Source Forwarding Stats**\n"]
+    for i, r in enumerate(rows[:20], 1):
+        pct  = f"{r['count']/grand*100:.1f}%" if grand else "0%"
+        last = r.get("last_seen", "")[:10]
+        lines.append(f"{i}. **{r['title']}**\n   `{r['count']:,}` files ({pct}) — last: {last}")
+    lines.append(f"\n**Total:** `{grand:,}` files")
+    await message.reply("\n".join(lines), parse_mode="markdown")
+
+
+# ── /pausefwd /resumefwd ───────────────────────────────────────────────────
 @_listener.on_message(filters.command("pausefwd") & filters.private)
 @admin_only
 async def cmd_pausefwd(client: Client, message: Message):
     global _paused
     if _paused:
-        await message.reply(
-            f"⏸️ Already paused. Dropped: `{_stats['skipped_paused']}`\n\nSend `/resumefwd` to resume.",
-            parse_mode="markdown"
-        )
+        await message.reply(f"⏸️ Already paused. Dropped: `{_stats['skipped_paused']}`\nSend `/resumefwd` to resume.", parse_mode="markdown")
         return
     _paused = True
-    logger.warning("⏸️ Forwarding PAUSED")
     await message.reply("⏸️ **Forwarding paused.**\nSend `/resumefwd` to resume.", parse_mode="markdown")
-    if LOG_CHANNEL:
-        try:
-            me = await client.get_me()
-            await client.send_message(LOG_CHANNEL, f"⏸️ Forwarding **paused** by `{me.first_name}`")
-        except Exception:
-            pass
 
 
-# ── /resumefwd ─────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("resumefwd") & filters.private)
 @admin_only
 async def cmd_resumefwd(client: Client, message: Message):
     global _paused
     if not _paused:
-        await message.reply("▶️ Already running — nothing to resume.", parse_mode="markdown")
+        await message.reply("▶️ Already running.", parse_mode="markdown")
         return
     dropped = _stats["skipped_paused"]
     _paused = False
     _stats["skipped_paused"] = 0
-    logger.info(f"▶️ Forwarding RESUMED — dropped {dropped} while paused")
-    await message.reply(
-        f"▶️ **Forwarding resumed.**\nDropped while paused: `{dropped}` files",
+    await message.reply(f"▶️ **Forwarding resumed.**\nDropped: `{dropped}` files", parse_mode="markdown")
+
+
+# ── /setcaption ────────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("setcaption") & filters.private)
+@admin_only
+async def cmd_setcaption(client: Client, message: Message):
+    args = message.text.split(None, 1)
+    if len(args) == 1:
+        current = cs_db.get()
+        if current:
+            await message.reply(f"**Current suffix:** `{current}`\n\nChange: `/setcaption <text>`\nRemove: `/setcaption off`", parse_mode="markdown")
+        else:
+            await message.reply("**No suffix set.**\n\nUse `/setcaption <text>` to add one.\nExample: `/setcaption 🎬 @MyChannel`", parse_mode="markdown")
+        return
+    text = args[1].strip()
+    if text.lower() == "off":
+        cs_db.clear()
+        await message.reply("✅ Caption suffix removed.", parse_mode="markdown")
+    else:
+        cs_db.set(text)
+        await message.reply(f"✅ **Caption suffix set:**\n`{text}`", parse_mode="markdown")
+
+
+# ── /strippatterns ─────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("strippatterns") & filters.private)
+@admin_only
+async def cmd_strippatterns(client: Client, message: Message):
+    args = message.text.split(None, 2)
+    sub  = args[1].strip().lower() if len(args) > 1 else "list"
+
+    if sub == "list":
+        patterns = sp_db.load()
+        if not patterns:
+            await message.reply("**Custom strip patterns:** _none_\n\nAdd: `/strippatterns add <regex>`", parse_mode="markdown")
+        else:
+            lines = ["**Custom strip patterns:**\n"] + [f"`{i}.` `{p}`" for i, p in enumerate(patterns, 1)]
+            lines.append("\nRemove: `/strippatterns remove <number>`")
+            await message.reply("\n".join(lines), parse_mode="markdown")
+
+    elif sub == "add":
+        if len(args) < 3 or not args[2].strip():
+            await message.reply("**Usage:** `/strippatterns add <regex pattern>`", parse_mode="markdown")
+            return
+        pattern = args[2].strip()
+        try:
+            added = sp_db.add(pattern)
+        except ValueError as e:
+            await message.reply(f"❌ Invalid regex: `{e}`", parse_mode="markdown")
+            return
+        if added:
+            await message.reply(f"✅ Pattern added: `{pattern}`\nTotal: `{sp_db.count()}`", parse_mode="markdown")
+        else:
+            await message.reply(f"⚠️ Already exists: `{pattern}`", parse_mode="markdown")
+
+    elif sub == "remove":
+        if len(args) < 3 or not args[2].strip().isdigit():
+            await message.reply("**Usage:** `/strippatterns remove <number>`", parse_mode="markdown")
+            return
+        removed = sp_db.remove(int(args[2].strip()))
+        if removed:
+            await message.reply(f"✅ Removed: `{removed}`", parse_mode="markdown")
+        else:
+            await message.reply("❌ Number out of range.", parse_mode="markdown")
+    else:
+        await message.reply(
+            "• `/strippatterns list`\n• `/strippatterns add <regex>`\n• `/strippatterns remove <number>`",
+            parse_mode="markdown"
+        )
+
+
+# ── /cleancaptions /stopcleaning ───────────────────────────────────────────
+@_listener.on_message(filters.command("cleancaptions") & filters.private)
+@admin_only
+async def cmd_cleancaptions(client: Client, message: Message):
+    global _cleaning_task, _stop_cleaning
+
+    if _cleaning_task and not _cleaning_task.done():
+        await message.reply("⚠️ Already running. Send `/stopcleaning` to cancel.", parse_mode="markdown")
+        return
+
+    args   = message.text.split(None, 1)
+    target = int(args[1].strip()) if len(args) > 1 and args[1].strip().lstrip("-").isdigit() else DEST_CHANNEL
+    if not target:
+        await message.reply("❌ No destination channel configured.", parse_mode="markdown")
+        return
+
+    _stop_cleaning = False
+    status_msg = await message.reply(
+        f"🧹 **Caption cleaning started**\n\nChannel: `{target}`\nSend `/stopcleaning` to stop.",
         parse_mode="markdown"
     )
-    if LOG_CHANNEL:
+
+    async def _clean_loop():
+        global _stop_cleaning
+        from caption_cleaner import clean as strip_watermarks
+        scanned = edited = skipped = errors = 0
+        last_update = asyncio.get_event_loop().time()
+
         try:
-            me = await client.get_me()
-            await client.send_message(LOG_CHANNEL,
-                f"▶️ Forwarding **resumed** by `{me.first_name}`\nDropped: `{dropped}` files")
+            async for msg in client.get_chat_history(target):
+                if _stop_cleaning:
+                    break
+                scanned += 1
+                now = asyncio.get_event_loop().time()
+                if now - last_update >= 5:
+                    try:
+                        await status_msg.edit(
+                            f"🧹 **Cleaning in progress...**\n\n"
+                            f"📂 Scanned: `{scanned:,}` | ✏️ Edited: `{edited:,}` | ❌ Errors: `{errors}`",
+                            parse_mode="markdown"
+                        )
+                    except Exception:
+                        pass
+                    last_update = now
+
+                if not msg.caption:
+                    skipped += 1
+                    continue
+                cleaned = strip_watermarks(msg.caption)
+                if cleaned == msg.caption.strip():
+                    skipped += 1
+                    continue
+                try:
+                    await msg.edit_caption(caption=cleaned or "")
+                    edited += 1
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    errors += 1
+                    await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"/cleancaptions error: {e}")
+
+        status = "✅ Complete" if not _stop_cleaning else "⛔ Stopped"
+        try:
+            await status_msg.edit(
+                f"🧹 **Caption cleaning {status}**\n\n"
+                f"📂 Scanned: `{scanned:,}` | ✏️ Edited: `{edited:,}` | ❌ Errors: `{errors}`",
+                parse_mode="markdown"
+            )
         except Exception:
             pass
 
+    _cleaning_task = asyncio.create_task(_clean_loop())
 
-# ── /srcstats ──────────────────────────────────────────────────────────────
-@_listener.on_message(filters.command("srcstats") & filters.private)
+
+@_listener.on_message(filters.command("stopcleaning") & filters.private)
 @admin_only
-async def cmd_srcstats(client: Client, message: Message):
-    rows = stats_db.get_all()
-    grand_total = stats_db.total()
-
-    if not rows:
-        await message.reply(
-            "📊 No forwarding stats yet.\n_Stats recorded per successful forward._",
-            parse_mode="markdown"
-        )
+async def cmd_stopcleaning(client: Client, message: Message):
+    global _stop_cleaning, _cleaning_task
+    if not _cleaning_task or _cleaning_task.done():
+        await message.reply("No cleaning job is running.", parse_mode="markdown")
         return
-
-    lines = ["**📊 Per-Source Forwarding Stats**\n"]
-    for i, row in enumerate(rows[:20], 1):
-        pct  = f"{row['count']/grand_total*100:.1f}%" if grand_total else "0%"
-        last = row.get("last_seen", "")[:10]
-        lines.append(
-            f"{i}. **{row['title']}**\n"
-            f"   `{row['count']:,}` files ({pct}) — last: {last}"
-        )
-
-    lines.append(f"\n**Total (all-time):** `{grand_total:,}` files")
-    if len(rows) > 20:
-        lines.append(f"_...and {len(rows)-20} more sources_")
-
-    await message.reply("\n".join(lines), parse_mode="markdown")
+    _stop_cleaning = True
+    await message.reply("⛔ Stopping after current message...", parse_mode="markdown")
 
 
 # ── /help ─────────────────────────────────────────────────────────────────
@@ -309,14 +437,14 @@ async def cmd_help(client: Client, message: Message):
     me = await client.get_me()
     await message.reply(
         f"**Multi-Account Forwarder** — `{me.first_name}`\n\n"
-        "**Commands:**\n"
         "• `/addchat` / `/removechat` / `/listchats`\n"
         "• `/route <src> <dest>` / `/routes`\n"
-        "• `/resetdups` — clear duplicate memory\n"
-        "• `/pausefwd` — pause all forwarding\n"
-        "• `/resumefwd` — resume forwarding\n"
-        "• `/srcstats` — files forwarded per source group\n"
-        "• `/poolstatus` — account pool + session stats\n",
+        "• `/resetdups` / `/srcstats`\n"
+        "• `/pausefwd` / `/resumefwd`\n"
+        "• `/setcaption <text|off>` — caption suffix\n"
+        "• `/strippatterns add/remove/list`\n"
+        "• `/cleancaptions` / `/stopcleaning`\n"
+        "• `/poolstatus` — account pool stats\n",
         parse_mode="markdown"
     )
 
@@ -324,23 +452,27 @@ async def cmd_help(client: Client, message: Message):
 # ── Startup ───────────────────────────────────────────────────────────────
 async def main():
     global _pool
-
     await _listener.start()
     me = await _listener.get_me()
     logger.info(f"🎧 Listener started as: {me.first_name} (@{me.username})")
 
     _pool = await AccountPool.create()
-    logger.info(f"🏊 Pool: {_pool.account_count()} account(s) loaded")
+    logger.info(f"🏊 Pool: {_pool.account_count()} account(s)")
 
     current = get_all_chats(SOURCE_CHATS)
     logger.info(f"👀 Watching {len(current)} sources | all-time: {stats_db.total():,} files")
 
+    asyncio.create_task(_session_watchdog())
+    logger.info("🛡️ Session watchdog started")
+
     if LOG_CHANNEL:
         try:
+            suffix = cs_db.get()
             await _listener.send_message(LOG_CHANNEL,
                 f"🏊 **Multi-account forwarder started**\n"
                 f"Listener: `{me.first_name}` | Pool: {_pool.account_count()} accounts\n"
-                f"Sources: {len(current)} | All-time: {stats_db.total():,} files forwarded")
+                f"Sources: {len(current)} | All-time: {stats_db.total():,} files\n"
+                f"Patterns: {sp_db.count()} | Suffix: " + (f"`{suffix}`" if suffix else "_none_"))
         except Exception:
             pass
 
