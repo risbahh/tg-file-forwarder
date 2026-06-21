@@ -19,11 +19,13 @@ DEST_CHANNEL    = int(_require("DEST_CHANNEL"))  # your private index channel ID
 
 # Comma-separated list of source group/channel usernames or IDs
 # e.g.  SOURCE_CHATS=CineAlliance,MoviesDump,-100123456789
-SOURCE_CHATS_RAW = _require("SOURCE_CHATS")
+# Optional — leave blank if you prefer to use /addchat commands only
+SOURCE_CHATS_RAW = os.environ.get("SOURCE_CHATS", "")
 SOURCE_CHATS = [
     int(c.strip()) if c.strip().lstrip("-").isdigit() else c.strip()
     for c in SOURCE_CHATS_RAW.split(",")
-]
+    if c.strip()
+] if SOURCE_CHATS_RAW.strip() else []
 
 # ── Optional tuning ───────────────────────────────────────
 DELAY          = float(os.environ.get("DELAY", "3"))          # seconds between each forward
