@@ -62,7 +62,7 @@ def admin_only(func):
     return wrapper
 
 # ── File handler (catches ALL chats dynamically) ───────────────────────────
-@app.on_message(filters.all & (filters.document | filters.video | filters.audio))
+@app.on_message(filters.document | filters.video | filters.audio)
 async def on_new_file(client: Client, message: Message):
     # Dynamically check against current chat list (picks up /addchat additions instantly)
     current_chats = get_all_chats(SOURCE_CHATS)
