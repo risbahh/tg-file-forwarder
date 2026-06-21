@@ -20,7 +20,7 @@ import os
 import time
 
 from pyrogram import Client
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, ChatForwardsRestricted
 
 from config import API_ID, API_HASH, DELAY, FLOOD_EXTRA, MAX_RETRIES
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 class AccountPool:
     def __init__(self, clients: list[Client]):
-        self._clients   : list[Client]    = clients
+        self._clients    : list[Client]     = clients
         self._flood_until: dict[int, float] = {}   # index → epoch when available
         self._fwd_counts : dict[int, int]   = {}   # index → forwards this session
         self._flood_counts: dict[int, int]  = {}   # index → times hit FloodWait
@@ -63,6 +63,10 @@ class AccountPool:
         """
         Forward a message using the best available account.
         Auto-rotates on FloodWait. Returns True on success.
+
+        FIX: falls back to copy_message when the source chat has content
+        protection enabled (ChatForwardsRestricted), so protected-content
+        channels no longer silently fail every attempt.
         """
         tried: set[int] = set()
         for _attempt in range(MAX_RETRIES * len(self._clients)):
@@ -84,10 +88,35 @@ class AccountPool:
                 self._fwd_counts[idx] = self._fwd_counts.get(idx, 0) + 1
                 return True
 
+            except ChatForwardsRestricted:
+                # Source chat has content protection — forward_messages is blocked.
+                # Fall back to copy_message which re-uploads and bypasses the restriction.
+                logger.warning(
+                    f"🔒 {self._label(idx)}: source chat has content protection "
+                    f"— falling back to copy_message"
+                )
+                try:
+                    await client.copy_message(
+                        chat_id=dest,
+                        from_chat_id=message.chat.id,
+                        message_id=message.id,
+                    )
+                    await asyncio.sleep(DELAY)
+                    self._fwd_counts[idx] = self._fwd_counts.get(idx, 0) + 1
+                    return True
+                except FloodWait as e:
+                    wait = e.value + FLOOD_EXTRA
+                    logger.warning(f"⏳ {self._label(idx)} FloodWait {e.value}s (copy) — switching")
+                    self._flood_until[idx]  = time.time() + wait
+                    self._flood_counts[idx] = self._flood_counts.get(idx, 0) + 1
+                    tried.add(idx)
+                except Exception as ce:
+                    logger.error(f"❌ {self._label(idx)} copy_message failed: {type(ce).__name__}: {ce}")
+                    tried.add(idx)
+
             except FloodWait as e:
                 wait = e.value + FLOOD_EXTRA
-                acct = self._label(idx)
-                logger.warning(f"⏳ {acct} FloodWait {e.value}s — switching account")
+                logger.warning(f"⏳ {self._label(idx)} FloodWait {e.value}s — switching account")
                 self._flood_until[idx]  = time.time() + wait
                 self._flood_counts[idx] = self._flood_counts.get(idx, 0) + 1
                 tried.add(idx)
@@ -109,8 +138,8 @@ class AccountPool:
         now = time.time()
         for i, c in enumerate(self._clients):
             try:
-                me      = await c.get_me()
-                name    = f"{me.first_name} (@{me.username})"
+                me   = await c.get_me()
+                name = f"{me.first_name} (@{me.username})"
             except Exception:
                 name = f"Account {i+1} (error)"
             flood  = self._flood_until.get(i, 0)
