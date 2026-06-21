@@ -1,5 +1,5 @@
 # Agent Session Notes — Auto-Filter Bot Project
-_Last updated: Session 5 | Date: 2026-06-21_
+_Last updated: Session 6 | Date: 2026-06-21_
 
 ---
 
@@ -9,6 +9,7 @@ _Last updated: Session 5 | Date: 2026-06-21_
 |---|---|---|
 | **Main Bot** | https://github.com/azizthekiller123/Auto-filter-bot-4 | Telegram auto-filter movie bot (production, on Railway) |
 | **File Forwarder** | https://github.com/azizthekiller123/tg-file-forwarder | Userbot that feeds files into the main bot's index channel |
+| **Forwarder v2** | https://github.com/bbaziz4155/Telegram-Forwarder-3 | Older bulk-copy bot (Telethon-based) — mined for feature ideas |
 
 ---
 
@@ -30,85 +31,124 @@ File auto-deletes after N minutes (anti-leech)
 - **DB**: MongoDB Atlas (motor async driver) — `MULTIPLE_DB=True`, DB1 threshold 407MB → auto-switches to DB2
 - **Deploy**: Railway (auto-deploy on GitHub push to main, ~2 min lag)
 - **Web server**: aiohttp on `PORT` env var (default 8080)
-- **Plugin loader**: custom `importlib.import_module` in bot.py (NOT exec_module)
-- **Health URL**: `https://web-production-ef06e.up.railway.app/ping` → `{"status": "ok", "bot": "AutofilterADVbot"}`
+- **Health URL**: `https://web-production-ef06e.up.railway.app/ping`
 
-### Critical Architecture Rules
+### Critical Rules
 - `plugins/pmfilter.py` line 848 has catch-all `group=0` handler → **new callbacks MUST use `group=-1`**
-- `/ban` and `/unban` canonical handlers are in `admin_features.py` ONLY (duplicates removed from `p_ttishow.py`)
-- `temp.BANNED_USERS` / `temp.BANNED_CHATS` `.remove()` calls must ALWAYS be in `try/except ValueError: pass` (list is empty after restart)
-- Bot URL: `https://web-production-ef06e.up.railway.app` (Railway public domain)
-- `RAILWAY_PUBLIC_DOMAIN` env var → used to build `URL` in info.py
-- Push to GitHub → Railway auto-deploys → no direct Railway edits ever
-
-### Key Files
-| File | Purpose |
-|---|---|
-| `bot.py` | Entry point, custom plugin loader, watchdog, web server startup |
-| `info.py` | All config from env vars — DB, bot token, channels, feature flags |
-| `plugins/pmfilter.py` | Core auto-filter logic — catch-all `group=0` handler |
-| `plugins/channel.py` | Auto-indexing new files posted to index channels |
-| `plugins/admin_features.py` | /ban /unban /bannedlist /trending /premium /deletelang |
-| `plugins/banned.py` | Banned users/chats filter middleware |
-| `plugins/p_ttishow.py` | /savegroup /leavechat /disablechat /enablechat /genlink /users /chats /group_cmd /admin_cmd |
-| `plugins/misc.py` | /id /whois /imdb /imdbcallback /listmovies /listseries |
-| `plugins/route.py` | aiohttp web routes: /ping /health /watch /stream |
-| `plugins/index.py` | Manual /index command to bulk-index a channel |
-| `dreamxbotz/` | Internal framework: keepalive ping, multi-client, stream server |
-| `AGENT_SESSION_NOTES.md` | Full bug fix ledger (in repo root) |
-
-### All Bugs Fixed (Sessions 1–4) — 32 Total
-| File | Bug | Fix |
-|---|---|---|
-| `banned.py` | `from_user` is None on channel posts → NoneType crash | Guard with `if not message.from_user: return` |
-| `misc.py` | `imdb_callback` — `btn` / `imdb.get()` could be None | Added None guards before access |
-| `misc.py` | `os.remove(local_user_photo)` not wrapped | Added `try/except OSError: pass` |
-| `admin_features.py` | `temp.BANNED_USERS` not synced on /ban /unban | Added `.append()` / `.remove()` with try/except |
-| `p_ttishow.py` | Duplicate /ban /unban handlers (conflict with admin_features.py) | Removed duplicates — canonical in admin_features.py only |
-| `p_ttishow.py` | `BANNED_CHATS.remove()` raises ValueError after restart | Wrapped in try/except ValueError |
-| `p_ttishow.py` | Anonymous admin crash in /group_cmd /admin_cmd | Added `if not message.from_user: return` guard |
-| `route.py` | `/health` endpoint missing → catch-all handler returns 500 | Known issue (no /health route defined) — /ping works fine |
+- `/ban` and `/unban` canonical handlers are in `admin_features.py` ONLY
+- `temp.BANNED_USERS` / `temp.BANNED_CHATS` `.remove()` calls MUST be in `try/except ValueError: pass`
+- Push to GitHub → Railway auto-deploys → never edit Railway directly
 
 ---
 
 ## 📡 File Forwarder — `tg-file-forwarder`
 
 ### What It Does
-A **userbot** (regular Telegram account running as a script) that:
-1. Joins target groups as a normal member (no admin needed)
-2. Watches for file messages (documents, videos)
-3. Copies them to the main bot's private index channel
-4. Main bot auto-indexes → files become searchable instantly
+A **userbot** that joins source groups as a normal member, watches for new file messages, and copies them to the main bot's private index channel. Main bot auto-indexes → files become searchable instantly.
 
-### Why Userbot (Not Bot)
-- Bots require `CHAT_ADMIN_REQUIRED` to be added to groups
-- Userbots join like normal members — source group owners never know
-- `SESSION_STRING` = your Telegram account session (generated by `session_gen.py`)
-
-### File Structure
+### Complete File Structure (Session 6)
 ```
 tg-file-forwarder/
-├── forwarder.py        # Real-time watcher + all admin commands
-├── multi_forwarder.py  # Same but rotates 2–3 accounts to avoid FloodWait
-├── bot_capture.py      # Captures ONLY files from a specific registered bot per group
-├── bulk_dump.py        # One-time historical dump with resume (forwarded.json)
-├── account_pool.py     # Pool of 2–3 accounts, auto-rotates on FloodWait
-├── chats_db.py         # Dynamic chat list storage (chats.json) — no redeploy needed
-├── router.py           # Route files to DEST_MOVIES/SERIES/SOUTH by filename pattern
+├── forwarder.py        # Real-time watcher (primary)
+├── multi_forwarder.py  # Multi-account version (pool of 2–3 accounts)
+├── bot_capture.py      # Captures files from a specific bot per group
+├── bulk_dump.py        # One-time historical dump with resume
+├── account_pool.py     # Rotates accounts on FloodWait
+├── chats_db.py         # Dynamic chat list (chats.json)
+├── router.py           # Routes by filename pattern → DEST_MOVIES/SERIES/SOUTH
 ├── seen_db.py          # Dedup via file_unique_id (seen.json)
-├── caption_cleaner.py  # Strip watermarks/links from captions before forwarding
-├── discovery.py        # Scan joined groups + search public groups for movie sources
-├── dashboard.py        # Web dashboard at PORT — /  /api/stats  /health
-├── bots_db.py          # Bot-group mapping for bot_capture.py (bots.json)
-├── tracker.py          # Progress tracker for bulk_dump.py resume (forwarded.json)
-├── session_gen.py      # Run ONCE locally to generate SESSION_STRING
+├── stats_db.py         # Per-source forwarding stats (stats.json)   ← NEW
+├── strip_patterns.py   # Runtime-editable watermark patterns         ← NEW
+├── caption_suffix.py   # Persistent caption suffix                   ← NEW
+├── caption_cleaner.py  # Strip watermarks — loads from strip_patterns.json
+├── utils.py            # safe_forward() — applies cleaning + suffix
+├── discovery.py        # Scan/search for movie groups
+├── dashboard.py        # Web dashboard at PORT
+├── bots_db.py          # Bot-group mapping for bot_capture.py
+├── tracker.py          # Resume progress for bulk_dump.py
+├── session_gen.py      # Generate SESSION_STRING once locally
 ├── config.py           # All settings from env vars
-├── utils.py            # safe_forward() with FloodWait handling + file helpers
-├── requirements.txt    # pyrofork==2.3.45 + tgcrypto-pyrofork + aiohttp + python-dotenv
-├── Procfile            # Railway: worker: python forwarder.py
-├── railway.toml        # Railway deploy config
+├── requirements.txt    # pyrofork==2.3.45 + tgcrypto-pyrofork + aiohttp
+├── Procfile            # worker: python forwarder.py
 └── .env.example        # All variables documented
 ```
+
+### Complete Command Reference
+| Command | What it does | File |
+|---|---|---|
+| `/addchat <chat>` | Add source group — instant, no redeploy | both |
+| `/removechat <chat>` | Remove source group | both |
+| `/listchats` | List all active sources | both |
+| `/fwrstatus` | Full stats: session, routing, suffix, patterns | forwarder.py |
+| `/poolstatus` | Pool account status + full stats | multi_forwarder.py |
+| `/route <src> <dest>` | Override destination for a source group | both |
+| `/routes` | Show all routing rules | both |
+| `/dupstats` | Duplicate detection stats | forwarder.py |
+| `/srcstats` | Files forwarded per source group | both |
+| `/resetdups` | Two-step: clear seen.json (shows warning first) | both |
+| `/pausefwd` | Pause all forwarding instantly | both |
+| `/resumefwd` | Resume forwarding, shows count dropped | both |
+| `/setcaption <text>` | Append custom line to every forwarded caption | both |
+| `/setcaption off` | Remove the suffix | both |
+| `/setcaption` | Show current suffix | both |
+| `/strippatterns list` | Show custom watermark strip patterns | both |
+| `/strippatterns add <regex>` | Add pattern — validated regex, instant effect | both |
+| `/strippatterns remove <n>` | Remove pattern by list number | both |
+| `/cleancaptions [channel_id]` | Scan & edit captions in index channel in-place | both |
+| `/stopcleaning` | Cancel a running /cleancaptions job | both |
+| `/discover` | Scan joined groups for movie sources | forwarder.py |
+| `/suggest <keyword>` | Search Telegram for public groups | forwarder.py |
+
+### Session Watchdog
+Both forwarder.py and multi_forwarder.py now have a background task (`_session_watchdog`) that:
+- Pings `get_me()` every 5 minutes
+- On `SessionRevoked` / `AuthKeyUnregistered` / `UserDeactivated`:
+  - Sends alert to LOG_CHANNEL and all ADMINS
+  - Message tells user to regenerate SESSION_STRING and redeploy
+  - Calls `os._exit(1)` so Railway auto-restarts
+
+### How /cleancaptions Works
+- Uses `client.get_chat_history(DEST_CHANNEL)` to iterate all messages
+- For each message with a caption: applies `clean()` from caption_cleaner.py
+- If cleaned != original: calls `msg.edit_caption(caption=cleaned)` with 0.5s rate-limit delay
+- Live progress updates every 5 seconds (scanned / edited / errors)
+- `/stopcleaning` sets a flag that exits the loop after the current message
+- Requires the userbot to have "Edit Messages" permission in the destination channel
+
+### How /strippatterns Works
+- Patterns stored in `strip_patterns.json` (auto-created)
+- `caption_cleaner.py` calls `strip_patterns.load()` on every caption clean (dynamic, no restart needed)
+- Each pattern is a Python regex validated before saving
+- Built-in patterns (in caption_cleaner.py) always run too — these are additive
+
+### How /setcaption Works
+- Suffix stored in `caption_suffix.json`
+- `utils.safe_forward()` reads it via `caption_suffix.get()` for every forward
+- If cleaned caption exists: appends `\n\n<suffix>`
+- If caption was fully stripped: suffix alone becomes the caption
+- Takes effect immediately on next forward, no restart needed
+
+### How /srcstats Works
+- `stats_db.py` writes to `stats.json` after every successful forward
+- Keyed by `chat_id` — tracks title, count, first_seen, last_seen
+- Sorted by count descending — shows top 20 sources
+- Grand total shown at bottom
+- Thread-safe (file lock)
+
+### /resetdups Two-Step Confirmation
+- Step 1: `/resetdups` → shows current ID count + warning (no changes made)
+- Step 2: `/resetdups confirm` → clears seen.json + notifies LOG_CHANNEL
+- Does NOT delete any files from Telegram
+
+### How seen_db.py Works
+- In-memory set + seen.json on disk
+- `file_unique_id` = Telegram's globally unique file fingerprint
+- Same file in two groups = same ID → forwarded once, skipped on repeat
+
+### How account_pool.py Works
+- Loads SESSION_STRING, SESSION_STRING_2, SESSION_STRING_3
+- On FloodWait: marks account unavailable, switches to next
+- On ChatForwardsRestricted: falls back to copy_message()
 
 ### Railway Environment Variables
 | Var | Required | Description |
@@ -116,140 +156,83 @@ tg-file-forwarder/
 | `API_ID` | ✅ | From my.telegram.org |
 | `API_HASH` | ✅ | From my.telegram.org |
 | `SESSION_STRING` | ✅ | Run session_gen.py locally once |
-| `DEST_CHANNEL` | ✅ | Main bot's index channel ID (negative int) |
-| `SOURCE_CHATS` | ⚡ | Comma-separated usernames/IDs — OPTIONAL (can use /addchat only) |
-| `ADMINS` | ⚡ | Your Telegram user ID — who can use commands |
-| `DELAY` | ⚡ | Seconds between forwards (default: 3) |
-| `ALLOWED_TYPES` | ⚡ | document,video (default) |
-| `LOG_CHANNEL` | ⚡ | Get notifications in a private channel |
-| `DEST_MOVIES` | ⚡ | Separate channel for standalone movies |
-| `DEST_SERIES` | ⚡ | Separate channel for TV series |
-| `DEST_SOUTH` | ⚡ | Separate channel for South Indian films |
-| `CLEAN_CAPTIONS` | ⚡ | true/false — strip watermarks (default: true) |
-| `SESSION_STRING_2` | ⚡ | Account 2 for multi_forwarder.py pool |
-| `SESSION_STRING_3` | ⚡ | Account 3 for multi_forwarder.py pool |
-
-### Commands (DM the userbot)
-| Command | What it does |
-|---|---|
-| `/addchat CineAlliance` | Add source group — takes effect instantly, no redeploy |
-| `/removechat CineAlliance` | Remove source group |
-| `/listchats` | Show all active sources |
-| `/fwrstatus` | Live stats (forwarded count, active chats, routing) |
-| `/route <src> <channel>` | Override destination for a specific source group |
-| `/routes` | Show all routing rules |
-| `/dupstats` | Duplicate detection stats |
-| `/resetdups` | Show warning + count → `/resetdups confirm` to clear seen.json |
-| `/discover` | Scan joined groups for movie sources |
-| `/suggest <keyword>` | Search Telegram for public groups |
-| `/poolstatus` | (multi_forwarder.py) Pool account status |
-| `/setbot <group> <bot>` | (bot_capture.py) Register bot to watch per group |
-| `/removebot <group>` | (bot_capture.py) Stop watching a group's bot |
-| `/listbots` | (bot_capture.py) List all bot-group registrations |
-| `/capturestatus` | (bot_capture.py) Live capture stats |
-
-### How /resetdups Works
-- **Step 1:** `/resetdups` → bot replies with current ID count and a warning explaining what reset means
-- **Step 2:** `/resetdups confirm` → clears `seen.json`, resets session dup counter to 0, logs to LOG_CHANNEL
-- Does NOT delete any files from Telegram — only erases the bot's memory of what it forwarded
-- Use when: switching index channels, seen.json corruption, or intentional re-forward from scratch
-
-### How caption_cleaner.py Works
-- Enabled by default (`CLEAN_CAPTIONS=true`)
-- Strips: @mentions, t.me links, http URLs, [bracketed tags], "Powered by" lines
-- When all caption content stripped → returns `None` → forwarded with `caption=""` (empty, not original)
-- Used in `utils.safe_forward()` via `message.copy(dest, caption=cleaned if cleaned is not None else "")`
-
-### How router.py Works
-- Reads `routing.json` for per-source overrides (set via `/route`)
-- Then detects filename patterns: `S01E01` / `Season` → series, `Tamil/Telugu/...` → south, else movie
-- Channels: `DEST_SERIES` / `DEST_SOUTH` / `DEST_MOVIES` / `DEST_CHANNEL` (fallback)
-
-### How seen_db.py Works
-- In-memory `set` + `seen.json` on disk
-- Keyed by `file_unique_id` — Telegram's globally unique file fingerprint
-- Same file in two different groups = same `file_unique_id` → forwarded once, skipped on repeat
-- `reset()` clears both in-memory cache and disk file
-
-### How account_pool.py Works
-- `AccountPool.create()` loads `SESSION_STRING`, `SESSION_STRING_2`, `SESSION_STRING_3`
-- `pool.forward(message, dest)` tries each account in order
-- On `FloodWait`: marks account unavailable until flood expires, switches to next account
-- On `ChatForwardsRestricted`: falls back to `copy_message` (bypasses content protection)
-- All accounts exhausted → returns False → logged as failed
+| `DEST_CHANNEL` | ✅ | Main bot's index channel ID |
+| `SOURCE_CHATS` | ⚡ | Optional — can use /addchat only |
+| `ADMINS` | ⚡ | Your Telegram user ID |
+| `LOG_CHANNEL` | ⚡ | Get startup/alert notifications |
+| `DEST_MOVIES` / `DEST_SERIES` / `DEST_SOUTH` | ⚡ | Multi-channel routing |
+| `CLEAN_CAPTIONS` | ⚡ | true/false (default: true) |
+| `SESSION_STRING_2` / `SESSION_STRING_3` | ⚡ | Extra accounts for pool |
 
 ---
 
-## 🐛 All Bugs Fixed in Session 5 — 7 Bugs + 1 Feature
+## 🐛 All Bugs Fixed — Sessions 1–5 (7 bugs)
 
-### Bug Fixes
-| File | Bug | Severity | Fix Applied |
-|---|---|---|---|
-| `dashboard.py` | `chats_cfg.keys()` returns `["chats"]` not actual chat IDs — dashboard showed wrong source count | 🔴 Critical | Changed to `chats_cfg.get("chats", [])` |
-| `utils.py` | `caption=None` passed to `message.copy()` — pyrofork keeps original caption, watermarks NOT removed | 🔴 Critical | Changed to `caption=cleaned if cleaned is not None else ""` |
-| `config.py` | `SOURCE_CHATS` was `_require()` (mandatory) — startup crash if not set, even when using /addchat only | 🔴 Critical | Made optional with empty list default |
-| `multi_forwarder.py` | `/route` cmd did `int(args[2].strip())` with no try/except — unhandled crash on bad input | 🟡 Medium | Added `try/except ValueError` with user-friendly error reply |
-| `account_pool.py` | `ChatForwardsRestricted` from protected channels had no fallback — silently failed | 🟡 Medium | Added fallback to `copy_message()` when `ChatForwardsRestricted` is raised |
-| `router.py` | `f"-100{key}"` generated wrong key when source_chat already had `-100` prefix | 🟡 Medium | Fixed: only append `-100{bare}` when source_chat does NOT start with `-100` |
-| `seen_db.py` + `router.py` | `open()` without `with` — file handles never closed | 🟢 Minor | Changed to `with open(file) as f:` context managers |
-
-### Feature Added
-| File | Feature |
-|---|---|
-| `forwarder.py` + `multi_forwarder.py` | `/resetdups` — two-step confirmation to clear seen.json; step 1 shows count + warning, step 2 (`/resetdups confirm`) performs the reset and notifies LOG_CHANNEL |
-
-### Previously fixed (Session 4)
 | File | Bug | Fix |
 |---|---|---|
-| `forwarder.py` | `filters.all` doesn't exist in pyrofork → AttributeError crash at startup | Removed `filters.all &` |
+| `dashboard.py` | `chats_cfg.keys()` showed wrong data | `chats_cfg.get("chats", [])` |
+| `utils.py` | `caption=None` kept watermarks | `caption=cleaned if cleaned is not None else ""` |
+| `config.py` | SOURCE_CHATS mandatory — startup crash | Made optional |
+| `multi_forwarder.py` | `/route` ValueError crash | try/except ValueError |
+| `account_pool.py` | ChatForwardsRestricted no fallback | Added copy_message fallback |
+| `router.py` | `-100` prefix doubled in key | Fixed prefix logic |
+| `seen_db.py` + `router.py` | Unclosed file handles | Changed to `with open()` |
 
 ---
 
-## 🔄 Workflow Between Agents
+## ✨ Features Added — Session 5–6
 
-### Pushing to GitHub
-Always use GitHub API with `$GITHUB_PERSONAL_ACCESS_TOKEN`:
+| Feature | File(s) | What it does |
+|---|---|---|
+| `/resetdups` | forwarder.py, multi_forwarder.py | Two-step confirm to clear seen.json |
+| `/pausefwd` / `/resumefwd` | forwarder.py, multi_forwarder.py | Pause/resume forwarding without restart |
+| `/srcstats` | forwarder.py, multi_forwarder.py + stats_db.py | Per-source forwarding count + all-time total |
+| Session watchdog | forwarder.py, multi_forwarder.py | Alert + exit on session revocation (checks every 5 min) |
+| `/cleancaptions` / `/stopcleaning` | forwarder.py, multi_forwarder.py | Edit existing captions in index channel in-place |
+| `/setcaption` | forwarder.py, multi_forwarder.py + caption_suffix.py | Append custom suffix to every forwarded caption |
+| `/strippatterns` | forwarder.py, multi_forwarder.py + strip_patterns.py | Runtime-editable watermark patterns |
+| Dynamic strip patterns | caption_cleaner.py | Loads strip_patterns.json on every clean (no restart) |
+| Caption suffix in forward | utils.py + caption_suffix.py | Appended after watermark stripping |
+
+---
+
+## 🔄 Workflow — Pushing to GitHub
+
+Always use GitHub API sequentially (never parallel — SHA conflicts):
 ```bash
 SHA=$(curl -s -H "Authorization: Bearer $GITHUB_PERSONAL_ACCESS_TOKEN" \
   -H "User-Agent: replit-agent" \
   "https://api.github.com/repos/azizthekiller123/REPO/contents/FILE" \
-  | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const j=JSON.parse(d);console.log(j.sha);})")
+  | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const j=JSON.parse(d);console.log(j.sha);});")
 
 curl -s -X PUT \
   -H "Authorization: Bearer $GITHUB_PERSONAL_ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "User-Agent: replit-agent" \
+  -H "Content-Type: application/json" -H "User-Agent: replit-agent" \
   "https://api.github.com/repos/azizthekiller123/REPO/contents/FILE" \
-  -d "{\"message\":\"fix: description\",\"content\":\"$(base64 -w0 file.py)\",\"sha\":\"$SHA\"}"
+  -d "{\"message\":\"feat: description\",\"content\":\"$(base64 -w0 file.py)\",\"sha\":\"$SHA\"}"
 ```
-- Push files **sequentially** (not parallel) — parallel pushes cause SHA conflicts
-- Railway auto-deploys on every push to main (~2 min)
-- `python3` is not available in the Replit sandbox — use `node -e` for JSON parsing
-
-### Verifying Bot is Live
-```bash
-curl https://web-production-ef06e.up.railway.app/ping
-# Returns: {"status": "ok", "bot": "AutofilterADVbot"}
-```
-
-### What to Work on Next
-1. Add `/health` route to `route.py` in the **main bot** (`Auto-filter-bot-4`) with real DB status check
-2. Add referral/invite tracking system to main bot
-3. Add `/addchat` `/removechat` to main bot for managing index channels dynamically
-4. Add per-source forwarding stats (how many files forwarded per group — stored in a stats.json)
-5. Add `/pausefwd` / `/resumefwd` commands to temporarily pause forwarding without restart
+- `python3` not available in Replit sandbox — use `node -e` for JSON parsing
+- Railway auto-deploys on every push (~2 min)
+- Health check: `curl https://web-production-ef06e.up.railway.app/ping`
 
 ---
 
-## ⚠️ Critical Rules for Any Agent Working on This
+## ⚠️ Critical Rules
 
-1. **NEVER** change `from pyrogram import` to `from pyrofork import` — library is pyrofork but imported as pyrogram
-2. **NEVER** run `pnpm dev` at workspace root — this is a Python bot project on Railway
-3. **NEVER** edit Railway directly — always push to GitHub and let Railway auto-deploy
-4. **ALWAYS** push files sequentially to GitHub — parallel pushes cause SHA conflicts
-5. **ALWAYS** wrap `.remove()` calls on `temp.BANNED_USERS` / `temp.BANNED_CHATS` in `try/except ValueError: pass`
-6. **ALWAYS** use `group=-1` for new callback handlers added to main bot
-7. `/ban` and `/unban` are ONLY in `admin_features.py` — never add elsewhere
-8. `python3` is not available in the Replit sandbox — use `node -e` for JSON parsing in bash
-9. `SOURCE_CHATS` is now optional in config.py — no crash if not set (uses /addchat instead)
-10. Bot health check URL: `https://web-production-ef06e.up.railway.app/ping`
+1. **NEVER** change `from pyrogram import` — library is pyrofork, imported as pyrogram
+2. **NEVER** push files in parallel — SHA conflicts
+3. **NEVER** edit Railway directly — push to GitHub only
+4. **ALWAYS** wrap `temp.BANNED_*` `.remove()` in `try/except ValueError: pass` (main bot)
+5. **ALWAYS** use `group=-1` for new callbacks in main bot
+6. `SOURCE_CHATS` is optional in config.py (fixed session 5)
+7. `python3` not available in Replit sandbox — use `node -e`
+
+---
+
+## 📋 What to Work on Next
+
+1. Add `/health` route to main bot's `route.py` with real DB status check
+2. Add `/addchat` `/removechat` to main bot for managing index channels dynamically
+3. Add per-source forwarding stats to web dashboard (dashboard.py reads stats.json)
+4. Add `/ignorechat <chat>` — skip files from specific groups even if in source list
+5. Referral/invite tracking system for main bot
