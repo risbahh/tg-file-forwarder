@@ -86,8 +86,8 @@ async def safe_forward(
 
     # Save to failed.json so /retry can recover files lost during FloodWait
     try:
-        failed_db.save(message.chat.id, message.id)
-        logger.info(f"💾 Saved to failed.json: chat={message.chat.id} msg={message.id}")
+        failed_db.save(message.chat.id, message.id, dest)
+        logger.info(f"💾 Saved to failed.json: chat={message.chat.id} msg={message.id} dest={dest}")
     except Exception as _e:
         logger.debug(f"failed_db.save error: {_e}")
     return False
