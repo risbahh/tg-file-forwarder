@@ -11,6 +11,7 @@ import asyncio
 import logging
 from pyrogram.errors import FloodWait
 from pyrogram.types  import Message
+import failed_db
 from config import DELAY, FLOOD_EXTRA, MAX_RETRIES
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,12 @@ async def safe_forward(
             logger.error(f"❌ Forward error (attempt {attempt}/{MAX_RETRIES}): {type(e).__name__}: {e}")
             await asyncio.sleep(5 * attempt)
 
+    # Save to failed.json so /retry can recover files lost during FloodWait
+    try:
+        failed_db.save(message.chat.id, message.id)
+        logger.info(f"💾 Saved to failed.json: chat={message.chat.id} msg={message.id}")
+    except Exception as _e:
+        logger.debug(f"failed_db.save error: {_e}")
     return False
 
 
