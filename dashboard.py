@@ -66,6 +66,9 @@ _HTML = """<!DOCTYPE html>
     <div class="card"><div class="val">{failed}</div><div class="lbl">Failed</div></div>
     <div class="card"><div class="val">{sources}</div><div class="lbl">Active source chats</div></div>
     <div class="card"><div class="val">{uptime}</div><div class="lbl">Uptime</div></div>
+    <div class="card"><div class="val">{failed_pending}</div><div class="lbl">Failed (pending retry)</div></div>
+    <div class="card"><div class="val">{ignored_count}</div><div class="lbl">Ignored chats</div></div>
+    <div class="card"><div class="val">{keyword_mode}</div><div class="lbl">Keyword filter</div></div>
   </div>
   <div class="section">
     <h2>Routing</h2>
@@ -74,6 +77,10 @@ _HTML = """<!DOCTYPE html>
   <div class="section">
     <h2>Source Chats</h2>
     <table><tr><th>Chat</th><th>Status</th></tr>{source_rows}</table>
+  </div>
+  <div class="section">
+    <h2>Top Sources (all-time)</h2>
+    <table><tr><th>Chat</th><th>Forwarded</th><th>Last Active</th></tr>{top_source_rows}</table>
   </div>
   <footer>TG File Forwarder — <a href="/api/stats" style="color:#7c6aff">JSON API</a></footer>
 </body>
@@ -128,15 +135,26 @@ def _gather_stats(stats_getter=None) -> dict:
         ("South",   os.environ.get("DEST_SOUTH",   "—")),
     ]
 
+    failed_items  = _read_json(os.environ.get("FAILED_DB_FILE",  "failed.json"),  [])
+    stats_data    = _read_json(os.environ.get("STATS_DB_FILE",   "stats.json"),   {})
+    ignored_data  = _read_json(os.environ.get("IGNORED_FILE",    "ignored.json"),  {})
+    keyword_data  = _read_json(os.environ.get("KEYWORDS_FILE",   "keywords.json"), {"mode": "off", "keywords": []})
+    top_sources   = sorted(stats_data.items(), key=lambda x: -x[1].get("count", 0))[:10]
+
     return {
         "forwarded":    forwarded,
         "seen_total":   len(seen_ids),
         "dup_skipped":  dup_skipped,
         "failed":       failed,
+        "failed_pending": len(failed_items) if isinstance(failed_items, list) else 0,
         "sources":      len(all_chats),
         "all_chats":    all_chats,
         "routing":      routing_info,
         "per_source":   routes_cfg,
+        "top_sources":  top_sources,
+        "ignored_count": len(ignored_data),
+        "keyword_mode": keyword_data.get("mode", "off"),
+        "keyword_count": len(keyword_data.get("keywords", [])),
         "uptime_sec":   time.time() - _start_ts,
     }
 
@@ -154,6 +172,11 @@ async def start_dashboard(stats_getter=None, port: int | None = None):
             f"<tr><td>{rtype}</td><td><code>{dest}</code></td></tr>"
             for rtype, dest in s["routing"]
         )
+        top_source_rows = "\n".join(
+            f'<tr><td>{info.get("title", cid)}</td><td>{info.get("count",0):,}</td><td>{(info.get("last_seen","")[:10])}</td></tr>'
+            for cid, info in s['top_sources']
+        ) or '<tr><td colspan=3><em>No data yet</em></td></tr>'
+
         source_rows = "\n".join(
             f'<tr><td><code>{chat}</code></td><td><span class="badge badge-ok">active</span></td></tr>'
             for chat in s["all_chats"]
@@ -167,8 +190,12 @@ async def start_dashboard(stats_getter=None, port: int | None = None):
             failed       = f"{s['failed']:,}",
             sources      = s["sources"],
             uptime       = _uptime_str(s["uptime_sec"]),
-            routing_rows = routing_rows,
-            source_rows  = source_rows,
+            routing_rows      = routing_rows,
+            source_rows       = source_rows,
+            top_source_rows   = top_source_rows,
+            failed_pending    = f"{s['failed_pending']:,}",
+            ignored_count     = s['ignored_count'],
+            keyword_mode      = s['keyword_mode'].upper(),
         )
         return web.Response(text=html, content_type="text/html")
 
