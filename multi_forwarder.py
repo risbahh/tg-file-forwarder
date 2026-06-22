@@ -29,6 +29,8 @@ import stats_db
 import strip_patterns as sp_db
 import caption_suffix as cs_db
 import failed_db
+import ignore_db
+import keyword_filter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,6 +113,11 @@ async def on_new_file(client: Client, message: Message):
     if not is_allowed_file(message, ALLOWED_TYPES):
         return
 
+    # Ignore-chat check
+    if ignore_db.is_ignored(chat_id):
+        logger.debug(f"U0001f6ab Ignored chat skipped: {chat_id}")
+        return
+
     for attr in ("document", "video", "audio"):
         obj = getattr(message, attr, None)
         if obj:
@@ -127,6 +134,14 @@ async def on_new_file(client: Client, message: Message):
     title = getattr(message.chat, "title", str(chat_id))
 
     logger.info(f"📥 [{title}] {label} {name} ({size}) → {dest}")
+
+    # Keyword filter check
+    caption_text = message.caption or ""
+    if not keyword_filter.passes(f"{name} {caption_text}"):
+        logger.info(f"🔍 Keyword filter blocked: {name}")
+        _stats["skipped_paused"] += 1
+        return
+
     ok = await _pool.forward(message, dest) if _pool else False
 
     if ok:
@@ -555,6 +570,35 @@ async def main():
 
     current = get_all_chats(SOURCE_CHATS)
     logger.info(f"👀 Watching {len(current)} sources | all-time: {stats_db.total():,} files")
+
+    # Auto-retry failed forwards from last session
+    failed_count = failed_db.count()
+    if failed_count > 0:
+        logger.info(f"⚠️  {failed_count} failed forward(s) from previous session — scheduling auto-retry in 30s")
+        async def _auto_retry():
+            await asyncio.sleep(30)
+            logger.info("🔄 Auto-retry: starting…")
+            items = failed_db.load()
+            ok_count = failed_count2 = 0
+            for item in items:
+                try:
+                    msg = await _listener.get_messages(int(item["chat_id"]), int(item["message_id"]))
+                    dest_r = item.get("dest", DEST_CHANNEL)
+                    if _pool and await _pool.forward(msg, dest_r):
+                        failed_db.remove(item["chat_id"], item["message_id"])
+                        ok_count += 1
+                    else:
+                        failed_count2 += 1
+                except Exception as exc:
+                    logger.warning(f"Auto-retry error: {exc}")
+                    failed_count2 += 1
+            logger.info(f"✅ Auto-retry done: {ok_count} recovered, {failed_count2} still failed")
+            if LOG_CHANNEL and ok_count > 0:
+                try:
+                    await _listener.send_message(LOG_CHANNEL, f"🔄 Auto-retry: {ok_count} recovered, {failed_count2} still failed")
+                except Exception:
+                    pass
+        asyncio.create_task(_auto_retry())
 
     asyncio.create_task(_session_watchdog())
     logger.info("🛡️ Session watchdog started")
