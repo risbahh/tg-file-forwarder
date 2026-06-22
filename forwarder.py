@@ -6,6 +6,7 @@ Commands (ADMINS only — DM the userbot):
   Routing:   /route /routes
   Pause:     /pausefwd /resumefwd
   Captions:  /setcaption /strippatterns /cleancaptions /stopcleaning
+  Recovery:  /failedstats /retry /clearfailed
   Discovery: /discover /suggest /help
 """
 import asyncio
@@ -32,6 +33,7 @@ from discovery import find_joined_sources, search_public_sources, format_results
 import stats_db
 import strip_patterns as sp_db
 import caption_suffix as cs_db
+import failed_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -574,6 +576,98 @@ async def cmd_suggest(client: Client, message: Message):
     await msg.edit(format_results(results, f"Public groups matching '{query}'"), parse_mode="markdown")
 
 
+
+# ── /failedstats ──────────────────────────────────────────────────────────────
+@app.on_message(filters.command("failedstats") & filters.private)
+@admin_only
+async def cmd_failedstats(client: Client, message: Message):
+    entries = failed_db.load()
+    if not entries:
+        await message.reply("✅ No failed forwards — failed.json is empty.")
+        return
+    breakdown = failed_db.by_chat()
+    lines = []
+    for chat_id, cnt in sorted(breakdown.items(), key=lambda x: -x[1]):
+        try:
+            chat = await client.get_chat(int(chat_id))
+            name = chat.title or str(chat_id)
+        except Exception:
+            name = str(chat_id)
+        lines.append(f"  • {name}: {cnt}")
+    import datetime
+    oldest = min(e.get('ts', 0) for e in entries)
+    oldest_str = datetime.datetime.fromtimestamp(oldest).strftime('%Y-%m-%d %H:%M') if oldest else '?'
+    text = (
+        f"**⚠️ Failed Forwards: {len(entries)} pending**\n\n"
+        f"**By source:**\n" + "\n".join(lines) +
+        f"\n\nOldest entry: {oldest_str}\n"
+        f"Run /retry to attempt recovery."
+    )
+    await message.reply(text, parse_mode="markdown")
+
+
+# ── /retry ────────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("retry") & filters.private)
+@admin_only
+async def cmd_retry(client: Client, message: Message):
+    entries = failed_db.load()
+    if not entries:
+        await message.reply("✅ Nothing to retry — failed.json is empty.")
+        return
+    prog = await message.reply(
+        f"🔄 Retrying {len(entries)} failed forward(s)... This may take a while.",
+        parse_mode="markdown"
+    )
+    ok = fail = skip = 0
+    for entry in list(entries):
+        chat_id    = entry["chat_id"]
+        message_id = entry["message_id"]
+        dest = get_destination(str(chat_id)) or DEST_CHANNEL
+        try:
+            msgs = await client.get_messages(chat_id, message_id)
+            msg = msgs if not isinstance(msgs, list) else msgs[0]
+            if not msg or not msg.id:
+                skip += 1
+                failed_db.remove(chat_id, message_id)
+                continue
+            success = await safe_forward(msg, dest, skip_duplicates=True)
+            if success:
+                ok += 1
+                failed_db.remove(chat_id, message_id)
+                stats_db.record(str(chat_id), getattr(msg.chat, 'title', str(chat_id)))
+            else:
+                fail += 1
+        except Exception as e:
+            logger.warning(f"Retry error chat={chat_id} msg={message_id}: {e}")
+            fail += 1
+        await asyncio.sleep(2)
+    await prog.edit(
+        f"**✅ Retry complete**\n\n"
+        f"✅ Succeeded: {ok}\n"
+        f"❌ Still failed: {fail}\n"
+        f"⏭️ Skipped (deleted): {skip}\n"
+        f"📋 Remaining in failed.json: {failed_db.count()}",
+        parse_mode="markdown"
+    )
+
+
+# ── /clearfailed ──────────────────────────────────────────────────────────────
+@app.on_message(filters.command("clearfailed") & filters.private)
+@admin_only
+async def cmd_clearfailed(client: Client, message: Message):
+    args = message.text.split(None, 1)
+    n = failed_db.count()
+    if len(args) < 2 or args[1].strip().lower() != "confirm":
+        await message.reply(
+            f"⚠️ This will clear {n} failed entry(s) from failed.json.\n"
+            f"Send /clearfailed confirm to proceed.",
+            parse_mode="markdown"
+        )
+        return
+    failed_db.clear()
+    await message.reply(f"🗑️ Cleared {n} failed entries from failed.json.")
+
+
 # ── /help ──────────────────────────────────────────────────────────────────
 @app.on_message(filters.command(["start", "help"]) & filters.private)
 async def cmd_help(client: Client, message: Message):
@@ -597,6 +691,10 @@ async def cmd_help(client: Client, message: Message):
         "• `/strippatterns add/remove/list` — manage watermark strip patterns\n"
         "• `/cleancaptions` — edit existing captions in index channel\n"
         "• `/stopcleaning` — cancel the clean job\n\n"
+        "**Recovery:**\n"
+        "• `/failedstats` — show failed forwards\n"
+        "• `/retry` — retry all failed\n"
+        "• `/clearfailed` — wipe failed list\n\n"
         "**Discovery:**\n"
         "• `/discover` / `/suggest <keyword>`\n",
         parse_mode="markdown"
