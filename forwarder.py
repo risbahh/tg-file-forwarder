@@ -940,14 +940,14 @@ async def main():
             await asyncio.sleep(30)
             logger.info("🔄 Auto-retry: starting…")
             from utils import safe_forward as _sf
-            items = failed_db.all()
+            items = failed_db.load()
             ok = failed = 0
             for item in items:
                 try:
-                    msg = await app.get_messages(int(item["chat_id"]), int(item["msg_id"]))
+                    msg = await app.get_messages(int(item["chat_id"]), int(item["message_id"]))
                     dest = item.get("dest", DEST_CHANNEL)
                     if await _sf(msg, dest):
-                        failed_db.remove(item["chat_id"], item["msg_id"])
+                        failed_db.remove(item["chat_id"], item["message_id"])
                         ok += 1
                     else:
                         failed += 1
