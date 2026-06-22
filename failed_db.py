@@ -26,11 +26,11 @@ def _save_raw(data: list):
         json.dump(data, f, indent=2)
 
 
-def save(chat_id: int, message_id: int):
-    """Record a failed forward."""
+def save(chat_id: int, message_id: int, dest: int = 0):
+    """Record a failed forward. `dest` is the intended destination channel."""
     with _lock:
         data = _load_raw()
-        entry = {"chat_id": chat_id, "message_id": message_id, "ts": time.time()}
+        entry = {"chat_id": chat_id, "message_id": message_id, "dest": dest, "ts": time.time()}
         # Deduplicate
         for e in data:
             if e["chat_id"] == chat_id and e["message_id"] == message_id:
