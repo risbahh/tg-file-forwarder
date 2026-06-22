@@ -78,3 +78,9 @@ def reset_all() -> int:
         count = len(data)
         _save({})
         return count
+
+
+def all_stats() -> dict:
+    """Return raw stats dict {chat_id_str: {title, count, first_seen, last_seen}}"""
+    with _lock:
+        return _load()
