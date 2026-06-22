@@ -637,7 +637,6 @@ async def cmd_retry(client: Client, message: Message):
     for entry in list(entries):
         chat_id    = entry["chat_id"]
         message_id = entry["message_id"]
-        dest = get_destination(str(chat_id)) or DEST_CHANNEL
         try:
             msgs = await client.get_messages(chat_id, message_id)
             msg = msgs if not isinstance(msgs, list) else msgs[0]
@@ -645,6 +644,8 @@ async def cmd_retry(client: Client, message: Message):
                 skip += 1
                 failed_db.remove(chat_id, message_id)
                 continue
+            stored_dest = entry.get("dest", 0)
+            dest = stored_dest or get_destination(get_file_name(msg), int(chat_id)) or DEST_CHANNEL
             success = await safe_forward(msg, dest, skip_duplicates=True)
             if success:
                 ok += 1
