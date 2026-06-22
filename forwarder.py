@@ -34,6 +34,8 @@ import stats_db
 import strip_patterns as sp_db
 import caption_suffix as cs_db
 import failed_db
+import ignore_db
+import keyword_filter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,6 +126,11 @@ async def on_new_file(client: Client, message: Message):
     if not is_allowed_file(message, ALLOWED_TYPES):
         return
 
+    # Ignore-chat check
+    if ignore_db.is_ignored(chat_id):
+        logger.debug(f"🚫 Ignored chat skipped: {chat_id}")
+        return
+
     name  = get_file_name(message)
     size  = human_size(get_file_size(message))
     dest  = get_destination(name, chat_id)
@@ -131,6 +138,14 @@ async def on_new_file(client: Client, message: Message):
     title = getattr(message.chat, "title", str(chat_id))
 
     logger.info(f"📥 [{title}] {label} {name} ({size}) → {dest}")
+
+    # Keyword filter check
+    caption_text = message.caption or ""
+    if not keyword_filter.passes(f"{name} {caption_text}"):
+        logger.info(f"🔍 Keyword filter blocked: {name}")
+        _stats["skipped_paused"] += 1
+        return
+
     success = await safe_forward(message, dest)
 
     if success:
@@ -668,6 +683,194 @@ async def cmd_clearfailed(client: Client, message: Message):
     await message.reply(f"🗑️ Cleared {n} failed entries from failed.json.")
 
 
+
+# ── /ignorechat  /unignorechat  /listignored ──────────────────────────────────
+@app.on_message(filters.command("ignorechat") & filters.private)
+@admin_only
+async def cmd_ignorechat(client: Client, message: Message):
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.reply("Usage: `/ignorechat <@username or chat_id>`", parse_mode="markdown")
+        return
+    target = args[1].strip()
+    try:
+        chat = await client.get_chat(target)
+        ignore_db.ignore(chat.id, chat.title or str(chat.id))
+        await message.reply(
+            f"🚫 Ignoring: **{chat.title}** (`{chat.id}`)\n"
+            f"Messages skipped silently. Use `/unignorechat` to re-enable.",
+            parse_mode="markdown"
+        )
+    except Exception as e:
+        await message.reply(f"❌ Cannot find chat: `{e}`", parse_mode="markdown")
+
+
+@app.on_message(filters.command("unignorechat") & filters.private)
+@admin_only
+async def cmd_unignorechat(client: Client, message: Message):
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.reply("Usage: `/unignorechat <@username or chat_id>`", parse_mode="markdown")
+        return
+    target = args[1].strip()
+    try:
+        chat = await client.get_chat(target)
+        ignore_db.unignore(chat.id)
+        await message.reply(f"✅ Re-enabled: **{chat.title}**", parse_mode="markdown")
+    except Exception as e:
+        await message.reply(f"❌ Cannot find chat: `{e}`", parse_mode="markdown")
+
+
+@app.on_message(filters.command("listignored") & filters.private)
+@admin_only
+async def cmd_listignored(client: Client, message: Message):
+    data = ignore_db.list_ignored()
+    if not data:
+        await message.reply("✅ No chats ignored — all sources active.")
+        return
+    import datetime
+    lines = [
+        f"• `{info.get('title', cid)}` — since "
+        f"{datetime.datetime.fromtimestamp(info.get('since',0)).strftime('%Y-%m-%d %H:%M')}"
+        for cid, info in data.items()
+    ]
+    await message.reply(
+        f"**🚫 Ignored ({len(data)}):**\n\n" + "\n".join(lines),
+        parse_mode="markdown"
+    )
+
+
+# ── /joinchat ─────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("joinchat") & filters.private)
+@admin_only
+async def cmd_joinchat(client: Client, message: Message):
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.reply(
+            "Usage: `/joinchat <invite_link or @username>`\n\n"
+            "Joins the chat and automatically adds it to sources.",
+            parse_mode="markdown"
+        )
+        return
+    link = args[1].strip()
+    prog = await message.reply(f"⏳ Joining `{link}`...", parse_mode="markdown")
+    try:
+        chat = await client.join_chat(link)
+        add_chat(str(chat.id))
+        await prog.edit(
+            f"✅ Joined and added to sources!\n\n"
+            f"**Chat:** {chat.title}\n"
+            f"**ID:** `{chat.id}`\n\n"
+            f"Now forwarding files from this chat.",
+            parse_mode="markdown"
+        )
+        logger.info(f"Joined and added source: {chat.title} ({chat.id})")
+    except Exception as e:
+        await prog.edit(f"❌ Failed to join: `{type(e).__name__}: {e}`", parse_mode="markdown")
+
+
+# ── /export ───────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("export") & filters.private)
+@admin_only
+async def cmd_export(client: Client, message: Message):
+    import csv, io, datetime, tempfile, os
+    data = stats_db.all_stats() if hasattr(stats_db, 'all_stats') else {}
+    if not data:
+        await message.reply("📊 No stats to export yet.")
+        return
+    fd, tmp = tempfile.mkstemp(suffix=".csv")
+    os.close(fd)
+    try:
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Chat ID", "Title", "Count", "First Seen", "Last Seen"])
+            for cid, info in sorted(data.items(), key=lambda x: -x[1].get("count", 0)):
+                writer.writerow([
+                    cid,
+                    info.get("title", ""),
+                    info.get("count", 0),
+                    info.get("first_seen", ""),
+                    info.get("last_seen", ""),
+                ])
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        await client.send_document(
+            message.chat.id,
+            document=tmp,
+            file_name=f"forwarder_stats_{ts}.csv",
+            caption=f"📊 Forwarding stats — {len(data)} sources | exported {ts}",
+        )
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+
+
+# ── /keywords ─────────────────────────────────────────────────────────────────
+@app.on_message(filters.command("keywords") & filters.private)
+@admin_only
+async def cmd_keywords(client: Client, message: Message):
+    args  = message.text.split(None, 2)
+    sub   = args[1].strip().lower() if len(args) > 1 else "list"
+    value = args[2].strip()         if len(args) > 2 else ""
+
+    if sub == "list":
+        state = keyword_filter.get_state()
+        kws   = state.get("keywords", [])
+        mode  = state.get("mode", "off")
+        if not kws:
+            await message.reply(
+                f"**🔍 Keyword filter** — mode: `{mode}`\n\nNo keywords set.\n\n"
+                "• `/keywords allow <word>` — only forward matching\n"
+                "• `/keywords block <word>` — skip matching\n"
+                "• `/keywords off` — disable filter", parse_mode="markdown"
+            )
+            return
+        lines = "\n".join(f"`{i+1}.` {k}" for i, k in enumerate(kws))
+        await message.reply(
+            f"**🔍 Keyword filter** — mode: `{mode}`\n\n{lines}\n\n"
+            "• `/keywords allow <word>` — add allow keyword\n"
+            "• `/keywords block <word>` — add block keyword\n"
+            "• `/keywords remove <n>` — remove by number\n"
+            "• `/keywords off` — disable filter", parse_mode="markdown"
+        )
+    elif sub in ("allow", "block"):
+        if not value:
+            await message.reply(f"Usage: `/keywords {sub} <keyword>`", parse_mode="markdown")
+            return
+        keyword_filter.set_mode(sub)
+        added = keyword_filter.add_keyword(value)
+        state = keyword_filter.get_state()
+        if added:
+            await message.reply(
+                f"✅ Added `{value}` to **{sub}** list.\n"
+                f"Mode: `{sub}` — {len(state['keywords'])} keyword(s) active.",
+                parse_mode="markdown"
+            )
+        else:
+            await message.reply(f"ℹ️ `{value}` already in list.", parse_mode="markdown")
+    elif sub in ("remove", "del"):
+        if not value.isdigit():
+            await message.reply("Usage: `/keywords remove <number>`", parse_mode="markdown")
+            return
+        result = keyword_filter.remove_keyword(int(value))
+        if result in ("No keywords set.", ) or result.startswith("Index"):
+            await message.reply(f"❌ {result}", parse_mode="markdown")
+        else:
+            await message.reply(f"🗑️ Removed: `{result}`", parse_mode="markdown")
+    elif sub == "off":
+        keyword_filter.set_mode("off")
+        await message.reply("✅ Keyword filter disabled — all files forwarded.", parse_mode="markdown")
+    else:
+        await message.reply(
+            "**Usage:**\n"
+            "• `/keywords list`\n"
+            "• `/keywords allow <word>`\n"
+            "• `/keywords block <word>`\n"
+            "• `/keywords remove <n>`\n"
+            "• `/keywords off`", parse_mode="markdown"
+        )
+
+
+
 # ── /help ──────────────────────────────────────────────────────────────────
 @app.on_message(filters.command(["start", "help"]) & filters.private)
 async def cmd_help(client: Client, message: Message):
@@ -695,6 +898,15 @@ async def cmd_help(client: Client, message: Message):
         "• `/failedstats` — show failed forwards\n"
         "• `/retry` — retry all failed\n"
         "• `/clearfailed` — wipe failed list\n\n"
+        "**Sources:**\n"
+        "• `/ignorechat <chat>` — pause a source\n"
+        "• `/unignorechat <chat>` — re-enable\n"
+        "• `/listignored` — show ignored\n"
+        "• `/joinchat <link>` — join + add to sources\n\n"
+        "**Filters:**\n"
+        "• `/keywords list/allow/block/remove/off`\n\n"
+        "**Export:**\n"
+        "• `/export` — download stats as CSV\n\n"
         "**Discovery:**\n"
         "• `/discover` / `/suggest <keyword>`\n",
         parse_mode="markdown"
@@ -719,6 +931,36 @@ async def main():
             logger.warning(f"  ⚠️  Not a member of: {src}")
         except Exception as e:
             logger.warning(f"  ⚠️  Cannot verify {src}: {e}")
+
+    # Auto-retry failed forwards from last session
+    failed_count = failed_db.count()
+    if failed_count > 0:
+        logger.info(f"⚠️  {failed_count} failed forward(s) from previous session — scheduling auto-retry in 30s")
+        async def _auto_retry():
+            await asyncio.sleep(30)
+            logger.info("🔄 Auto-retry: starting…")
+            from utils import safe_forward as _sf
+            items = failed_db.all()
+            ok = failed = 0
+            for item in items:
+                try:
+                    msg = await app.get_messages(int(item["chat_id"]), int(item["msg_id"]))
+                    dest = item.get("dest", DEST_CHANNEL)
+                    if await _sf(msg, dest):
+                        failed_db.remove(item["chat_id"], item["msg_id"])
+                        ok += 1
+                    else:
+                        failed += 1
+                except Exception as exc:
+                    logger.warning(f"Auto-retry error: {exc}")
+                    failed += 1
+            logger.info(f"✅ Auto-retry done: {ok} recovered, {failed} still failed")
+            if LOG_CHANNEL and ok > 0:
+                try:
+                    await app.send_message(LOG_CHANNEL, f"🔄 Auto-retry: {ok} recovered, {failed} still failed")
+                except Exception:
+                    pass
+        asyncio.create_task(_auto_retry())
 
     # Start watchdog
     asyncio.create_task(_session_watchdog())
