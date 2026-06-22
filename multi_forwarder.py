@@ -31,6 +31,7 @@ import caption_suffix as cs_db
 import failed_db
 import ignore_db
 import keyword_filter
+from dashboard import start_dashboard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +44,8 @@ ADMINS = [
     int(x.strip()) for x in os.environ.get("ADMINS", "").split(",")
     if x.strip().isdigit()
 ]
+
+PORT = int(os.environ.get("PORT", "8080"))
 
 _listener = Client(
     "multi_fwd_listener",
@@ -142,7 +145,7 @@ async def on_new_file(client: Client, message: Message):
         _stats["skipped_paused"] += 1
         return
 
-    ok = await _pool.forward(message, dest) if _pool else False
+    ok = await _pool.forward_from_source(message, dest, str(chat_id)) if _pool else False
 
     if ok:
         for attr in ("document", "video", "audio"):
@@ -159,385 +162,121 @@ async def on_new_file(client: Client, message: Message):
         logger.error(f"❌ All accounts failed for: {name}")
 
 
+
 # ── /poolstatus ────────────────────────────────────────────────────────────
 @_listener.on_message(filters.command("poolstatus") & filters.private)
 @admin_only
 async def cmd_poolstatus(client: Client, message: Message):
     if not _pool:
-        await message.reply("Pool not initialized yet.")
+        await message.reply("⚠️ Pool not initialized yet.")
         return
     text = await _pool.status()
-    pause_line = f"\n⏸️ **PAUSED** — {_stats['skipped_paused']} dropped\n" if _paused else ""
-    suffix = cs_db.get()
+    # Append global session stats
     text += (
-        f"\n{pause_line}"
-        f"✅ Forwarded: `{_stats['forwarded']}`\n"
-        f"⏭️ Dup-skipped: `{_stats['skipped_dup']}`\n"
-        f"⏸️ Paused-dropped: `{_stats['skipped_paused']}`\n"
-        f"❌ Failed: `{_stats['failed']}`\n"
-        f"🗂️ Seen DB: `{seen_count():,}`\n"
-        f"📊 All-time: `{stats_db.total():,}` files\n"
-        f"**Suffix:** " + (f"`{suffix}`" if suffix else "_not set_") + "\n"
-        f"**Patterns:** `{sp_db.count()}`"
+        f"\n\n**Session totals:**\n"
+        f"✅ Forwarded: `{_stats['forwarded']:,}`\n"
+        f"⏭️ Dedup skipped: `{_stats['skipped_dup']:,}`\n"
+        f"❌ Failed: `{_stats['failed']:,}`\n"
+        f"⏸️ Paused/filtered: `{_stats['skipped_paused']:,}`"
     )
     await message.reply(text, parse_mode="markdown")
 
 
-# ── Source commands ────────────────────────────────────────────────────────
-@_listener.on_message(filters.command("addchat") & filters.private)
+# ── /assignsource ──────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("assignsource") & filters.private)
 @admin_only
-async def cmd_addchat(client: Client, message: Message):
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        await message.reply("Usage: `/addchat <username or id>`", parse_mode="markdown")
+async def cmd_assignsource(client: Client, message: Message):
+    """
+    /assignsource <chat_id or @username> <account_number>
+    
+    Pin a source chat to a specific account for forwarding.
+    The listener always watches all sources; this controls which
+    account is USED to forward files from that source.
+    FloodWait failover still applies — if the assigned account is
+    unavailable, the next free account takes over automatically.
+    
+    Example: /assignsource @MoviesSource 2
+    """
+    if not _pool:
+        await message.reply("⚠️ Pool not initialized yet.")
         return
-    ok, msg = add_chat(args[1].strip())
-    await message.reply(msg, parse_mode="markdown")
-
-
-@_listener.on_message(filters.command("removechat") & filters.private)
-@admin_only
-async def cmd_removechat(client: Client, message: Message):
-    args = message.text.split(None, 1)
-    if len(args) < 2:
-        await message.reply("Usage: `/removechat <username or id>`", parse_mode="markdown")
-        return
-    ok, msg = remove_chat(args[1].strip())
-    await message.reply(msg, parse_mode="markdown")
-
-
-@_listener.on_message(filters.command("listchats") & filters.private)
-@admin_only
-async def cmd_listchats(client: Client, message: Message):
-    await message.reply(list_chats(SOURCE_CHATS), parse_mode="markdown")
-
-
-# ── Routing ────────────────────────────────────────────────────────────────
-@_listener.on_message(filters.command("route") & filters.private)
-@admin_only
-async def cmd_route(client: Client, message: Message):
-    args = message.text.split(None, 2)
-    if len(args) < 3:
-        await message.reply("**Usage:** `/route <source_chat> <dest_channel>`\n\n" + list_routes(), parse_mode="markdown")
-        return
-    try:
-        dest_int = int(args[2].strip())
-    except ValueError:
-        await message.reply("❌ Destination must be a channel ID (negative integer).", parse_mode="markdown")
-        return
-    await message.reply(set_route(args[1].strip(), dest_int), parse_mode="markdown")
-
-
-@_listener.on_message(filters.command("routes") & filters.private)
-@admin_only
-async def cmd_routes(client: Client, message: Message):
-    await message.reply(list_routes(), parse_mode="markdown")
-
-
-# ── /resetdups /srcstats ───────────────────────────────────────────────────
-@_listener.on_message(filters.command("resetdups") & filters.private)
-@admin_only
-async def cmd_resetdups(client: Client, message: Message):
-    args = message.text.split(None, 1)
-    confirmed = len(args) > 1 and args[1].strip().lower() == "confirm"
-    n = seen_count()
-    if not confirmed:
-        await message.reply(f"⚠️ Will erase `{n:,}` tracked IDs.\nNo files deleted — only memory.\n\n**To confirm:** `/resetdups confirm`", parse_mode="markdown")
-        return
-    seen_reset()
-    _stats["skipped_dup"] = 0
-    await message.reply(f"✅ Cleared `{n:,}` file IDs.", parse_mode="markdown")
-
-
-@_listener.on_message(filters.command("srcstats") & filters.private)
-@admin_only
-async def cmd_srcstats(client: Client, message: Message):
-    rows  = stats_db.get_all()
-    grand = stats_db.total()
-    if not rows:
-        await message.reply("📊 No forwarding stats yet.", parse_mode="markdown")
-        return
-    lines = ["**📊 Per-Source Forwarding Stats**\n"]
-    for i, r in enumerate(rows[:20], 1):
-        pct  = f"{r['count']/grand*100:.1f}%" if grand else "0%"
-        last = r.get("last_seen", "")[:10]
-        lines.append(f"{i}. **{r['title']}**\n   `{r['count']:,}` files ({pct}) — last: {last}")
-    lines.append(f"\n**Total:** `{grand:,}` files")
-    await message.reply("\n".join(lines), parse_mode="markdown")
-
-
-# ── /pausefwd /resumefwd ───────────────────────────────────────────────────
-@_listener.on_message(filters.command("pausefwd") & filters.private)
-@admin_only
-async def cmd_pausefwd(client: Client, message: Message):
-    global _paused
-    if _paused:
-        await message.reply(f"⏸️ Already paused. Dropped: `{_stats['skipped_paused']}`\nSend `/resumefwd` to resume.", parse_mode="markdown")
-        return
-    _paused = True
-    await message.reply("⏸️ **Forwarding paused.**\nSend `/resumefwd` to resume.", parse_mode="markdown")
-
-
-@_listener.on_message(filters.command("resumefwd") & filters.private)
-@admin_only
-async def cmd_resumefwd(client: Client, message: Message):
-    global _paused
-    if not _paused:
-        await message.reply("▶️ Already running.", parse_mode="markdown")
-        return
-    dropped = _stats["skipped_paused"]
-    _paused = False
-    _stats["skipped_paused"] = 0
-    await message.reply(f"▶️ **Forwarding resumed.**\nDropped: `{dropped}` files", parse_mode="markdown")
-
-
-# ── /setcaption ────────────────────────────────────────────────────────────
-@_listener.on_message(filters.command("setcaption") & filters.private)
-@admin_only
-async def cmd_setcaption(client: Client, message: Message):
-    args = message.text.split(None, 1)
-    if len(args) == 1:
-        current = cs_db.get()
-        if current:
-            await message.reply(f"**Current suffix:** `{current}`\n\nChange: `/setcaption <text>`\nRemove: `/setcaption off`", parse_mode="markdown")
-        else:
-            await message.reply("**No suffix set.**\n\nUse `/setcaption <text>` to add one.\nExample: `/setcaption 🎬 @MyChannel`", parse_mode="markdown")
-        return
-    text = args[1].strip()
-    if text.lower() == "off":
-        cs_db.clear()
-        await message.reply("✅ Caption suffix removed.", parse_mode="markdown")
-    else:
-        cs_db.set(text)
-        await message.reply(f"✅ **Caption suffix set:**\n`{text}`", parse_mode="markdown")
-
-
-# ── /strippatterns ─────────────────────────────────────────────────────────
-@_listener.on_message(filters.command("strippatterns") & filters.private)
-@admin_only
-async def cmd_strippatterns(client: Client, message: Message):
-    args = message.text.split(None, 2)
-    sub  = args[1].strip().lower() if len(args) > 1 else "list"
-
-    if sub == "list":
-        patterns = sp_db.load()
-        if not patterns:
-            await message.reply("**Custom strip patterns:** _none_\n\nAdd: `/strippatterns add <regex>`", parse_mode="markdown")
-        else:
-            lines = ["**Custom strip patterns:**\n"] + [f"`{i}.` `{p}`" for i, p in enumerate(patterns, 1)]
-            lines.append("\nRemove: `/strippatterns remove <number>`")
-            await message.reply("\n".join(lines), parse_mode="markdown")
-
-    elif sub == "add":
-        if len(args) < 3 or not args[2].strip():
-            await message.reply("**Usage:** `/strippatterns add <regex pattern>`", parse_mode="markdown")
-            return
-        pattern = args[2].strip()
-        try:
-            added = sp_db.add(pattern)
-        except ValueError as e:
-            await message.reply(f"❌ Invalid regex: `{e}`", parse_mode="markdown")
-            return
-        if added:
-            await message.reply(f"✅ Pattern added: `{pattern}`\nTotal: `{sp_db.count()}`", parse_mode="markdown")
-        else:
-            await message.reply(f"⚠️ Already exists: `{pattern}`", parse_mode="markdown")
-
-    elif sub == "remove":
-        if len(args) < 3 or not args[2].strip().isdigit():
-            await message.reply("**Usage:** `/strippatterns remove <number>`", parse_mode="markdown")
-            return
-        removed = sp_db.remove(int(args[2].strip()))
-        if removed:
-            await message.reply(f"✅ Removed: `{removed}`", parse_mode="markdown")
-        else:
-            await message.reply("❌ Number out of range.", parse_mode="markdown")
-    else:
+    args = message.text.split()
+    if len(args) < 3 or not args[2].isdigit():
         await message.reply(
-            "• `/strippatterns list`\n• `/strippatterns add <regex>`\n• `/strippatterns remove <number>`",
+            "**Usage:** `/assignsource <chat_id or @username> <account_number>`\n\n"
+            "Example: `/assignsource @MoviesSource 2`\n"
+            f"Available accounts: 1 to {_pool.account_count()}",
             parse_mode="markdown"
         )
-
-
-# ── /cleancaptions /stopcleaning ───────────────────────────────────────────
-@_listener.on_message(filters.command("cleancaptions") & filters.private)
-@admin_only
-async def cmd_cleancaptions(client: Client, message: Message):
-    global _cleaning_task, _stop_cleaning
-
-    if _cleaning_task and not _cleaning_task.done():
-        await message.reply("⚠️ Already running. Send `/stopcleaning` to cancel.", parse_mode="markdown")
         return
-
-    args   = message.text.split(None, 1)
-    target = int(args[1].strip()) if len(args) > 1 and args[1].strip().lstrip("-").isdigit() else DEST_CHANNEL
-    if not target:
-        await message.reply("❌ No destination channel configured.", parse_mode="markdown")
+    source   = args[1].strip()
+    acc_num  = int(args[2]) - 1   # convert to 0-based
+    err = _pool.assign(source, acc_num)
+    if err:
+        await message.reply(f"❌ {err}", parse_mode="markdown")
         return
-
-    _stop_cleaning = False
-    status_msg = await message.reply(
-        f"🧹 **Caption cleaning started**\n\nChannel: `{target}`\nSend `/stopcleaning` to stop.",
+    await message.reply(
+        f"📌 **Source assigned**\n\n"
+        f"Source: `{source}`\n"
+        f"→ Account {acc_num + 1}\n\n"
+        f"Failover is automatic if that account hits FloodWait.",
         parse_mode="markdown"
     )
 
-    async def _clean_loop():
-        global _stop_cleaning
-        from caption_cleaner import clean as strip_watermarks
-        scanned = edited = skipped = errors = 0
-        last_update = asyncio.get_event_loop().time()
 
-        try:
-            async for msg in client.get_chat_history(target):
-                if _stop_cleaning:
-                    break
-                scanned += 1
-                now = asyncio.get_event_loop().time()
-                if now - last_update >= 5:
-                    try:
-                        await status_msg.edit(
-                            f"🧹 **Cleaning in progress...**\n\n"
-                            f"📂 Scanned: `{scanned:,}` | ✏️ Edited: `{edited:,}` | ❌ Errors: `{errors}`",
-                            parse_mode="markdown"
-                        )
-                    except Exception:
-                        pass
-                    last_update = now
-
-                if not msg.caption:
-                    skipped += 1
-                    continue
-                cleaned = strip_watermarks(msg.caption)
-                if cleaned == msg.caption.strip():
-                    skipped += 1
-                    continue
-                try:
-                    await msg.edit_caption(caption=cleaned or "")
-                    edited += 1
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    errors += 1
-                    await asyncio.sleep(2)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"/cleancaptions error: {e}")
-
-        status = "✅ Complete" if not _stop_cleaning else "⛔ Stopped"
-        try:
-            await status_msg.edit(
-                f"🧹 **Caption cleaning {status}**\n\n"
-                f"📂 Scanned: `{scanned:,}` | ✏️ Edited: `{edited:,}` | ❌ Errors: `{errors}`",
-                parse_mode="markdown"
-            )
-        except Exception:
-            pass
-
-    _cleaning_task = asyncio.create_task(_clean_loop())
-
-
-@_listener.on_message(filters.command("stopcleaning") & filters.private)
+# ── /unassignsource ────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("unassignsource") & filters.private)
 @admin_only
-async def cmd_stopcleaning(client: Client, message: Message):
-    global _stop_cleaning, _cleaning_task
-    if not _cleaning_task or _cleaning_task.done():
-        await message.reply("No cleaning job is running.", parse_mode="markdown")
+async def cmd_unassignsource(client: Client, message: Message):
+    if not _pool:
+        await message.reply("⚠️ Pool not initialized yet.")
         return
-    _stop_cleaning = True
-    await message.reply("⛔ Stopping after current message...", parse_mode="markdown")
+    args = message.text.split(None, 1)
+    if len(args) < 2:
+        await message.reply("**Usage:** `/unassignsource <chat_id or @username>`", parse_mode="markdown")
+        return
+    source = args[1].strip()
+    removed = _pool.unassign(source)
+    if removed:
+        await message.reply(
+            f"✅ Assignment removed for `{source}`\n"
+            f"It will now use round-robin across all accounts.",
+            parse_mode="markdown"
+        )
+    else:
+        await message.reply(f"ℹ️ `{source}` had no specific assignment.", parse_mode="markdown")
 
 
-
-# ── /failedstats ──────────────────────────────────────────────────────────────
-@app.on_message(filters.command("failedstats") & filters.private)
+# ── /assignments ───────────────────────────────────────────────────────────
+@_listener.on_message(filters.command("assignments") & filters.private)
 @admin_only
-async def cmd_failedstats(client: Client, message: Message):
-    entries = failed_db.load()
-    if not entries:
-        await message.reply("✅ No failed forwards — failed.json is empty.")
+async def cmd_assignments(client: Client, message: Message):
+    if not _pool:
+        await message.reply("⚠️ Pool not initialized yet.")
         return
-    breakdown = failed_db.by_chat()
+    data = _pool.get_assignments()
+    if not data:
+        await message.reply(
+            "📋 **No source assignments** — all sources use round-robin.\n\n"
+            "Use `/assignsource <chat> <account_num>` to pin a source to an account.",
+            parse_mode="markdown"
+        )
+        return
+    # Group by account
+    by_acc: dict[int, list[str]] = {}
+    for src, idx in data.items():
+        by_acc.setdefault(idx, []).append(src)
     lines = []
-    for chat_id, cnt in sorted(breakdown.items(), key=lambda x: -x[1]):
-        try:
-            chat = await client.get_chat(int(chat_id))
-            name = chat.title or str(chat_id)
-        except Exception:
-            name = str(chat_id)
-        lines.append(f"  • {name}: {cnt}")
-    import datetime
-    oldest = min(e.get('ts', 0) for e in entries)
-    oldest_str = datetime.datetime.fromtimestamp(oldest).strftime('%Y-%m-%d %H:%M') if oldest else '?'
-    text = (
-        f"**⚠️ Failed Forwards: {len(entries)} pending**\n\n"
-        f"**By source:**\n" + "\n".join(lines) +
-        f"\n\nOldest entry: {oldest_str}\n"
-        f"Run /retry to attempt recovery."
-    )
-    await message.reply(text, parse_mode="markdown")
-
-
-# ── /retry ────────────────────────────────────────────────────────────────────
-@app.on_message(filters.command("retry") & filters.private)
-@admin_only
-async def cmd_retry(client: Client, message: Message):
-    entries = failed_db.load()
-    if not entries:
-        await message.reply("✅ Nothing to retry — failed.json is empty.")
-        return
-    prog = await message.reply(
-        f"🔄 Retrying {len(entries)} failed forward(s)... This may take a while.",
-        parse_mode="markdown"
-    )
-    ok = fail = skip = 0
-    for entry in list(entries):
-        chat_id    = entry["chat_id"]
-        message_id = entry["message_id"]
-        dest = get_destination(str(chat_id)) or DEST_CHANNEL
-        try:
-            msgs = await pool.get_client().get_messages(chat_id, message_id)
-            msg = msgs if not isinstance(msgs, list) else msgs[0]
-            if not msg or not msg.id:
-                skip += 1
-                failed_db.remove(chat_id, message_id)
-                continue
-            client_to_use = await pool.get_available()
-            success = await safe_forward_pool(msg, dest, pool, skip_duplicates=True)
-            if success:
-                ok += 1
-                failed_db.remove(chat_id, message_id)
-                stats_db.record(str(chat_id), getattr(msg.chat, 'title', str(chat_id)))
-            else:
-                fail += 1
-        except Exception as e:
-            logger.warning(f"Retry error chat={chat_id} msg={message_id}: {e}")
-            fail += 1
-        await asyncio.sleep(2)
-    await prog.edit(
-        f"**✅ Retry complete**\n\n"
-        f"✅ Succeeded: {ok}\n"
-        f"❌ Still failed: {fail}\n"
-        f"⏭️ Skipped (deleted): {skip}\n"
-        f"📋 Remaining in failed.json: {failed_db.count()}",
+    for idx in sorted(by_acc):
+        srcs = ", ".join(f"`{s}`" for s in by_acc[idx])
+        lines.append(f"**Account {idx+1}:** {srcs}")
+    await message.reply(
+        f"📌 **Source assignments** ({len(data)} assigned):\n\n" + "\n".join(lines) +
+        "\n\nUnassigned sources use round-robin across all accounts.",
         parse_mode="markdown"
     )
 
 
-# ── /clearfailed ──────────────────────────────────────────────────────────────
-@app.on_message(filters.command("clearfailed") & filters.private)
-@admin_only
-async def cmd_clearfailed(client: Client, message: Message):
-    args = message.text.split(None, 1)
-    n = failed_db.count()
-    if len(args) < 2 or args[1].strip().lower() != "confirm":
-        await message.reply(
-            f"⚠️ This will clear {n} failed entry(s) from failed.json.\n"
-            f"Send /clearfailed confirm to proceed.",
-            parse_mode="markdown"
-        )
-        return
-    failed_db.clear()
-    await message.reply(f"🗑️ Cleared {n} failed entries from failed.json.")
 
 
 # ── /help ─────────────────────────────────────────────────────────────────
@@ -602,6 +341,13 @@ async def main():
 
     asyncio.create_task(_session_watchdog())
     logger.info("🛡️ Session watchdog started")
+
+    asyncio.create_task(start_dashboard(
+        stats_getter=lambda: _stats,
+        pool_getter=lambda: _pool,
+        port=PORT,
+    ))
+    logger.info(f"📊 Dashboard starting on port {PORT}")
 
     if LOG_CHANNEL:
         try:
