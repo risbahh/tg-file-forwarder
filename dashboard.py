@@ -82,6 +82,10 @@ _HTML = """<!DOCTYPE html>
     <h2>Top Sources (all-time)</h2>
     <table><tr><th>Chat</th><th>Forwarded</th><th>Last Active</th></tr>{top_source_rows}</table>
   </div>
+  <div class="section">
+    <h2>Account Pool</h2>
+    <table><tr><th>#</th><th>Account</th><th>Status</th><th>Forwarded</th><th>FloodWaits</th><th>Pinned Sources</th></tr>{pool_rows}</table>
+  </div>
   <footer>TG File Forwarder — <a href="/api/stats" style="color:#7c6aff">JSON API</a></footer>
 </body>
 </html>"""
@@ -105,7 +109,7 @@ def _read_json(path: str, default):
         return default
 
 
-def _gather_stats(stats_getter=None) -> dict:
+def _gather_stats(stats_getter=None, pool_getter=None) -> dict:
     forwarded   = 0
     dup_skipped = 0
     failed      = 0
@@ -141,6 +145,15 @@ def _gather_stats(stats_getter=None) -> dict:
     keyword_data  = _read_json(os.environ.get("KEYWORDS_FILE",   "keywords.json"), {"mode": "off", "keywords": []})
     top_sources   = sorted(stats_data.items(), key=lambda x: -x[1].get("count", 0))[:10]
 
+    pool_status   = []
+    if pool_getter:
+        try:
+            p = pool_getter()
+            if p and hasattr(p, "get_status_list"):
+                pool_status = p.get_status_list()
+        except Exception:
+            pass
+
     return {
         "forwarded":    forwarded,
         "seen_total":   len(seen_ids),
@@ -156,10 +169,11 @@ def _gather_stats(stats_getter=None) -> dict:
         "keyword_mode": keyword_data.get("mode", "off"),
         "keyword_count": len(keyword_data.get("keywords", [])),
         "uptime_sec":   time.time() - _start_ts,
+        "pool_status":  pool_status,
     }
 
 
-async def start_dashboard(stats_getter=None, port: int | None = None):
+async def start_dashboard(stats_getter=None, pool_getter=None, port: int | None = None):
     """
     Start the aiohttp dashboard server as a background coroutine.
     Call from forwarder.py: asyncio.create_task(start_dashboard(lambda: _stats))
@@ -167,11 +181,23 @@ async def start_dashboard(stats_getter=None, port: int | None = None):
     _port = port or int(os.environ.get("PORT", 8080))
 
     async def handle_html(request):
-        s = _gather_stats(stats_getter)
+        s = _gather_stats(stats_getter, pool_getter)
         routing_rows = "\n".join(
             f"<tr><td>{rtype}</td><td><code>{dest}</code></td></tr>"
             for rtype, dest in s["routing"]
         )
+        pool_rows = ''.join(
+            (
+                f'<tr><td>{a["idx"]+1}</td>'
+                f'<td><b>{a["name"]}</b> (@{a["username"]})</td>'
+                f'<td class="{"ok" if a["available"] else "warn"}">{"✅ Available" if a["available"] else f"⏳ {a["flood_remaining"]:.0f}s"}</td>'
+                f'<td>{a["fwd_count"]:,}</td>'
+                f'<td>{a["flood_count"]}</td>'
+                f'<td>{(", ".join(a["assigned_sources"][:3]) + ("…" if len(a["assigned_sources"]) > 3 else "")) or "round-robin"}</td></tr>'
+            )
+            for a in s["pool_status"]
+        ) or '<tr><td colspan=6><em>Pool not running</em></td></tr>'
+
         top_source_rows = "\n".join(
             f'<tr><td>{info.get("title", cid)}</td><td>{info.get("count",0):,}</td><td>{(info.get("last_seen","")[:10])}</td></tr>'
             for cid, info in s['top_sources']
@@ -192,6 +218,7 @@ async def start_dashboard(stats_getter=None, port: int | None = None):
             uptime       = _uptime_str(s["uptime_sec"]),
             routing_rows      = routing_rows,
             source_rows       = source_rows,
+            pool_rows         = pool_rows,
             top_source_rows   = top_source_rows,
             failed_pending    = f"{s['failed_pending']:,}",
             ignored_count     = s['ignored_count'],
@@ -200,7 +227,7 @@ async def start_dashboard(stats_getter=None, port: int | None = None):
         return web.Response(text=html, content_type="text/html")
 
     async def handle_json(request):
-        s = _gather_stats(stats_getter)
+        s = _gather_stats(stats_getter, pool_getter)
         return web.json_response(s)
 
     async def handle_health(request):
