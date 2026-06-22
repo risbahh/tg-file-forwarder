@@ -218,6 +218,7 @@ Upload: send_video(video=file_id, thumb=cleaned_path) — no full video download
 | **tg-thumb-cleaner new repo** | **7** | **separate repo** |
 | **Thumbnail watermark removal** | **7** | **thumb_cleaner.py** |
 | **/preview test command** | **7** | **main.py (thumb-cleaner)** |
+| **/bulk + /stopbulk** | **7** | **main.py (thumb-cleaner)** |
 
 ---
 
