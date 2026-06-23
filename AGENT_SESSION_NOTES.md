@@ -82,8 +82,9 @@ tg-file-forwarder/
 | `DEST_SERIES` | optional | Separate channel for TV series |
 | `DEST_SOUTH` | optional | Separate channel for South Indian films |
 | `SESSION_STRING_2..5` | optional | Extra accounts for multi_forwarder.py |
-| `SOURCE_BOT` | pm only | Bot username to watch (default: NarutoXMoviesBot) |
-| `SOURCE_GROUPS` | pm only | Groups to watch for PM bot results |
+| `SOURCE_BOTS` | pm only | Comma-separated bot usernames to watch, e.g. `NarutoXMoviesBot,HDMoviesBot` |
+| `SOURCE_BOT` | pm only | Legacy fallback if `SOURCE_BOTS` not set (default: NarutoXMoviesBot) |
+| `SOURCE_GROUPS` | pm only | Groups to watch for PM bot results (empty = all groups) |
 | `PM_DELAY` | pm only | Seconds between PM start commands (default: 4) |
 
 ---
@@ -100,7 +101,7 @@ Start command: python forwarder.py
 ```
 Repo: risbahh/tg-file-forwarder
 Start command: python pm_bot_forwarder.py
-Extra env: SOURCE_BOT, SOURCE_GROUPS, PM_DELAY
+Extra env: SOURCE_BOTS (or SOURCE_BOT), SOURCE_GROUPS, PM_DELAY
 ```
 
 **Important:** Mount a Railway Volume at `/app` so JSON databases (`seen.json`, `failed.json`, `pm_processed.json`, etc.) survive redeploys.
@@ -215,9 +216,10 @@ Both entry points support the same commands. DM the userbot account to use them.
 ### PM Bot Forwarder only (pm_bot_forwarder.py)
 | Command | Description |
 |---------|-------------|
-| `/dumpbot <group> [limit]` | Scan history, queue all past deep links |
-| `/pmstatus` | Queue, forwarded, skipped counts |
-| `/pmclear confirm` | Reset processed-links cache |
+| `/dumpbot <group> [limit]` | Scan history, queue all past deep links from ALL watched bots |
+| `/pmstatus` | Queue, forwarded, skipped counts + per-bot breakdown |
+| `/listbots` | Show all currently watched bots |
+| `/pmclear confirm` | Reset processed-links cache (file dedup untouched) |
 
 ---
 
@@ -241,22 +243,29 @@ Both entry points support the same commands. DM the userbot account to use them.
 | 10 | `pm_bot_forwarder.py` | `_queue` type annotation only, no value — potential NameError | Initialized as `None`, set in `main()` |
 | 10 | `pm_bot_forwarder.py` | `_admin_only` decorator didn't guard against `message.from_user` being None | Added None guard |
 | 10 | `failed_db.py` | Docstring entry format missing `dest` field | Updated docstring |
+| 10 | `pm_bot_forwarder.py` | `asyncio.get_event_loop()` deprecated since Python 3.10 — used in 3 places | Replaced with `asyncio.get_running_loop()` |
+| 10 | `pm_bot_forwarder.py` | Only watched single `SOURCE_BOT` — missed all other auto-filter bots | Added `SOURCE_BOTS` multi-bot env var + `_SOURCE_BOT_SET` |
+| 10 | `pm_bot_forwarder.py` | Dedup key was bare `start_param` — BotA:files_123 and BotB:files_123 treated as same | Key changed to `"botname:start_param"` |
+| 10 | `pm_bot_forwarder.py` | `_admin_only` had no `functools.wraps` — stripped `__doc__`, `__module__` from handlers | Added `@wraps(func)` |
+| 10 | `pm_bot_forwarder.py` | `/pmstatus`, `/pmclear`, `/dumpbot`, `/help` all referenced single SOURCE_BOT | All updated to show full bot list + per-bot stats |
 
 ---
 
 ## What to Build Next
 
-1. **Multi-source bot support in `pm_bot_forwarder.py`** — currently watches one `SOURCE_BOT`. Add support for a comma-separated `SOURCE_BOTS` list so multiple auto-filter bots in different groups can be captured simultaneously.
+1. ~~**Multi-source bot support in `pm_bot_forwarder.py`**~~ ✅ **DONE (Session 10)** — `SOURCE_BOTS` env var, multi-bot set lookup, per-bot stats.
 
-2. **`/schedule off HH:MM HH:MM`** — quiet-hours auto-pause. The user declined this for the PM forwarder (wants 24/7) but it may be useful for the main `forwarder.py` to reduce Railway compute costs.
+2. **Quality routing in `pm_bot_forwarder.py`** — the PM bot sends multiple quality versions of each movie (480p, 720p, 1080p). Add `PREFERRED_QUALITY=1080p` env var to filter which versions get forwarded.
 
-3. **Railway Volume reminder** — remind the user to mount a volume at `/app` so JSON databases survive redeploys. Without this, `seen.json` resets on every deploy and files get re-forwarded.
+3. **`/schedule off HH:MM HH:MM`** — quiet-hours auto-pause. User declined for PM forwarder (wants 24/7) but may be useful for `forwarder.py` to reduce Railway compute costs during off-hours.
 
-4. **Quality routing in `pm_bot_forwarder.py`** — the PM bot sends multiple quality versions of each movie (480p, 720p, 1080p). Add an option to only capture specific qualities (e.g. `PREFERRED_QUALITY=1080p`).
+4. **Railway Volume reminder** — user must mount a volume at `/app` so JSON databases survive redeploys. Without it, `seen.json` resets on every deploy and files get re-forwarded.
 
 5. **`/balancepool`** — redistribute source groups evenly across pool accounts in `multi_forwarder.py`.
 
 6. **Per-source keyword filters** (not global) — current `/keywords` is global. Some sources post non-movie content; per-source filters would help.
+
+7. **Session watchdog for `pm_bot_forwarder.py`** — `forwarder.py` has a session watchdog that pings Telegram every 5 min and alerts admins if the session is revoked. `pm_bot_forwarder.py` is missing this — add it so Railway knows to alert on session revoke.
 
 ---
 
