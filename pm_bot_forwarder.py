@@ -34,6 +34,12 @@ Environment variables:
   PM_DELAY            Seconds between PM start commands (default: 4)
   LOG_CHANNEL         Channel to log startup/activity (optional)
   PM_PROCESSED_FILE   Path to processed-links JSON (default: pm_processed.json)
+
+  Caption watermark replacement (optional):
+  MY_USERNAME         Your username WITHOUT @ — every @mention in captions is replaced
+                      e.g. MY_USERNAME=Moviebot123  →  @NarutoXMoviesBot → @Moviebot123
+  MY_CHANNEL_URL      Your channel link — every t.me/... URL in captions is replaced
+                      e.g. MY_CHANNEL_URL=https://t.me/backupchannek
 """
 
 import asyncio
@@ -67,6 +73,46 @@ ADMIN_IDS    = [
     if x.strip().lstrip("-").isdigit()
 ]
 _PROCESSED_FILE = os.environ.get("PM_PROCESSED_FILE", "pm_processed.json")
+
+# ── Caption watermark replacement ─────────────────────────────────────────────
+# Set MY_USERNAME and/or MY_CHANNEL_URL to replace bot watermarks with your own.
+# If neither is set, files are forwarded as-is (original caption preserved).
+MY_USERNAME    = os.environ.get("MY_USERNAME", "").lstrip("@").strip()
+MY_CHANNEL_URL = os.environ.get("MY_CHANNEL_URL", "").strip()
+
+# Matches any @username (Telegram allows a-z, 0-9, underscore, min 5 chars,
+# but we match all @word tokens to be safe — bots often use short names too)
+_RE_USERNAME = re.compile(r'@[\w]{1,}')
+# Full https://t.me/... links (must come BEFORE bare t.me to avoid double-replace)
+_RE_TG_HTTPS = re.compile(r'https?://t(?:elegram)?\.me/[\w@/?=&]+', re.IGNORECASE)
+# Bare t.me/... links not preceded by // (so we don't double-match the above)
+_RE_TG_BARE  = re.compile(r'(?<![/])t\.me/[\w@/?=&]+', re.IGNORECASE)
+
+
+def _clean_caption(caption: str | None) -> str | None:
+    """
+    Replace every @username and every t.me/... link in a caption with the
+    owner's details (MY_USERNAME / MY_CHANNEL_URL).
+
+    Returns the cleaned string, or the original if nothing needs changing.
+    Returns None if caption was None.
+    """
+    if not caption:
+        return caption
+
+    result = caption
+
+    # 1. Replace full https://t.me/... links first (most specific pattern)
+    if MY_CHANNEL_URL:
+        result = _RE_TG_HTTPS.sub(MY_CHANNEL_URL, result)
+        result = _RE_TG_BARE.sub(MY_CHANNEL_URL, result)
+
+    # 2. Replace all @mentions — skip if replacement equals the mention itself
+    if MY_USERNAME:
+        result = _RE_USERNAME.sub(f"@{MY_USERNAME}", result)
+
+    return result
+
 
 # ── Multi-bot config (SOURCE_BOTS, falls back to SOURCE_BOT) ─────────────────
 # SOURCE_BOTS = "NarutoXMoviesBot,HDMoviesBot,CineAllianceBot"
@@ -326,7 +372,19 @@ async def on_pm_file(client: Client, message: Message):
     _mark_seen(unique_id)
 
     try:
-        await message.forward(DEST_CHANNEL)
+        cleaned = _clean_caption(message.caption)
+        caption_changed = cleaned != message.caption
+
+        if caption_changed or MY_USERNAME or MY_CHANNEL_URL:
+            # Use copy() so we can inject the cleaned caption.
+            # copy() sends the file fresh without a "Forwarded from" header.
+            await message.copy(DEST_CHANNEL, caption=cleaned)
+            if caption_changed:
+                logger.debug(f"Caption cleaned: {message.caption!r} → {cleaned!r}")
+        else:
+            # No replacement configured — plain forward (preserves original formatting)
+            await message.forward(DEST_CHANNEL)
+
         _stats["forwarded"] += 1
         bot_key = username
         if bot_key not in _stats["by_bot"]:
@@ -458,12 +516,19 @@ async def cmd_pmstatus(client: Client, message: Message):
         f"{_stats['by_bot'].get(b.lower(), {}).get('forwarded', 0)} forwarded"
         for b in SOURCE_BOTS_LIST
     )
+    caption_parts = []
+    if MY_USERNAME:
+        caption_parts.append(f"@mentions → @{MY_USERNAME}")
+    if MY_CHANNEL_URL:
+        caption_parts.append(f"links → {MY_CHANNEL_URL}")
+    caption_status = " | ".join(caption_parts) if caption_parts else "off (forwarding original captions)"
     await message.reply(
         f"**📊 PM Bot Forwarder Status**\n\n"
         f"🤖 Bots watched ({len(SOURCE_BOTS_LIST)}):\n{bots_str}\n\n"
         f"👁 Groups: `{len(SOURCE_GROUPS)}` configured (0 = watch all)\n"
         f"📺 Destination: `{DEST_CHANNEL}`\n"
-        f"🔁 File dedup: {dedup}\n\n"
+        f"🔁 File dedup: {dedup}\n"
+        f"✏️ Caption replace: {caption_status}\n\n"
         f"🔗 Start params processed: `{len(_processed):,}`\n"
         f"✅ Files forwarded: `{_stats['forwarded']:,}`\n"
         f"⏭ Duplicates skipped: `{_stats['skipped_dup']:,}`\n"
