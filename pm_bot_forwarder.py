@@ -3,32 +3,32 @@ PM Bot Forwarder — pm_bot_forwarder.py
 
 Watches source groups for auto-filter bot result messages (e.g. NarutoXMoviesBot).
 When the bot posts deep-link results in the group, this userbot:
-  1. Extracts the `start=files_XXXXX` deep links from every result message
-  2. Sends /start <param> to the bot in PM (via a rate-limited queue)
+  1. Extracts every `start=files_XXXXX` deep link from the result message
+  2. Sends /start <param> to the bot in PM via a rate-limited queue
   3. Captures every file/video the bot sends back in PM
-  4. Forwards each file immediately to DEST_CHANNEL — skipping duplicates permanently
+  4. Forwards each file immediately to DEST_CHANNEL — permanently skipping duplicates
 
-Deduplication:
-  - file_unique_id stored in seen_db (seen.json) — survives restarts
-  - processed start params stored in pm_processed.json — survives restarts
+Deduplication (both layers survive restarts):
+  • file_unique_id  → seen_db (seen.json)         never re-forward same file
+  • start param     → pm_processed.json            never re-send same deep link
 
-Commands (DM the userbot):
-  /dumpbot <group> [limit]  — scan group history, queue all past deep links
-  /pmstatus                 — show queue, processed, forwarded counts
-  /pmclear confirm          — reset the processed-links cache (re-process all)
-  /help                     — command list
+Commands (DM the userbot, admin only):
+  /dumpbot <group> [limit]  scan group history, queue all past deep links
+  /pmstatus                 queue size, forwarded/skipped counts
+  /pmclear confirm          reset processed-links cache (keeps file dedup intact)
+  /help                     this message
 
 Environment variables:
-  SESSION_STRING    Pyrogram session string
-  API_ID            Telegram API ID
-  API_HASH          Telegram API hash
-  SOURCE_BOT        Bot username to watch (default: NarutoXMoviesBot)
-  SOURCE_GROUPS     Comma-separated group IDs/usernames to watch for results
-  DEST_CHANNEL      Channel ID to forward files into
-  ADMIN_IDS         Comma-separated admin Telegram user IDs
-  PM_DELAY          Seconds between PM start commands (default: 4)
-  LOG_CHANNEL       (optional) channel to log activity
-  PM_PROCESSED_FILE Path to processed-links JSON (default: pm_processed.json)
+  SESSION_STRING      Pyrogram session string
+  API_ID              Telegram API ID
+  API_HASH            Telegram API hash
+  SOURCE_BOT          Bot username to watch (default: NarutoXMoviesBot)
+  SOURCE_GROUPS       Comma-separated group IDs/usernames to watch
+  DEST_CHANNEL        Channel ID to forward files into
+  ADMIN_IDS           Comma-separated admin Telegram user IDs
+  PM_DELAY            Seconds between PM start commands (default: 4)
+  LOG_CHANNEL         (optional) channel to log activity
+  PM_PROCESSED_FILE   Path to processed-links JSON (default: pm_processed.json)
 """
 
 import asyncio
@@ -36,8 +36,6 @@ import json
 import logging
 import os
 import re
-import threading
-import time
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
@@ -62,19 +60,22 @@ PM_DELAY      = float(os.environ.get("PM_DELAY", "4"))
 ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()]
 _PROCESSED_FILE = os.environ.get("PM_PROCESSED_FILE", "pm_processed.json")
 
+# Parse SOURCE_GROUPS into a mixed list of int IDs and str usernames
 _raw_groups   = [g.strip() for g in os.environ.get("SOURCE_GROUPS", "").split(",") if g.strip()]
-SOURCE_GROUPS: list[int | str] = []
+SOURCE_GROUPS: list = []
 for _g in _raw_groups:
     try:
         SOURCE_GROUPS.append(int(_g))
     except ValueError:
-        SOURCE_GROUPS.append(_g)
+        SOURCE_GROUPS.append(_g.lstrip("@").lower())
 
 # ── Persistent: processed start params ───────────────────────────────────────
-_proc_lock = threading.Lock()
+_proc_lock = asyncio.Lock()          # async-safe; held only for in-memory ops
+_SAVE_BATCH = 50                     # write pm_processed.json every N new items
+_unsaved_count = 0                   # items added since last save
 
 
-def _load_processed() -> set[str]:
+def _load_processed() -> set:
     if os.path.exists(_PROCESSED_FILE):
         try:
             with open(_PROCESSED_FILE) as f:
@@ -85,40 +86,44 @@ def _load_processed() -> set[str]:
     return set()
 
 
-def _save_processed(processed: set[str]):
-    with open(_PROCESSED_FILE, "w") as f:
-        json.dump(sorted(processed), f)
+def _flush_processed(processed: set):
+    """Write processed set to disk (called outside the async lock)."""
+    try:
+        with open(_PROCESSED_FILE, "w") as f:
+            json.dump(sorted(processed), f)
+    except Exception as e:
+        logger.warning(f"pm_processed save error: {e}")
 
 
-_processed: set[str] = _load_processed()
+_processed: set = _load_processed()
 logger.info(f"Loaded {len(_processed):,} already-processed start params from {_PROCESSED_FILE}")
 
-# ── Persistent: seen file_unique_ids (uses seen_db) ──────────────────────────
+# ── Persistent: seen file_unique_ids via seen_db ──────────────────────────────
 try:
-    from seen_db import is_seen, mark_seen
+    from seen_db import is_seen as _is_seen_db, mark_seen as _mark_seen_db
     _USE_SEEN_DB = True
-    logger.info("Using seen_db for file deduplication (persistent)")
+    logger.info("Using seen_db for file deduplication (persistent ✅)")
 except ImportError:
     _USE_SEEN_DB = False
-    _seen_ids: set[str] = set()
-    logger.warning("seen_db not found — using in-memory dedup (resets on restart)")
+    _seen_ids: set = set()
+    logger.warning("seen_db not found — using in-memory dedup (resets on restart ⚠️)")
 
 
-def _is_seen(file_unique_id: str) -> bool:
+def _is_seen(uid: str) -> bool:
     if _USE_SEEN_DB:
-        return is_seen(file_unique_id)
-    return file_unique_id in _seen_ids
+        return _is_seen_db(uid)
+    return uid in _seen_ids
 
 
-def _mark_seen(file_unique_id: str):
+def _mark_seen(uid: str):
     if _USE_SEEN_DB:
-        mark_seen(file_unique_id)
+        _mark_seen_db(uid)
     else:
-        _seen_ids.add(file_unique_id)
+        _seen_ids.add(uid)
 
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
-_queue: asyncio.Queue
+_queue: asyncio.Queue | None = None   # initialized in main() after event loop starts
 _stats = {"queued": 0, "forwarded": 0, "skipped_dup": 0, "errors": 0}
 
 DEEPLINK_RE = re.compile(
@@ -137,16 +142,35 @@ app = Client(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _admin_only(func):
-    async def wrapper(client, message):
-        if not ADMIN_IDS or message.from_user.id in ADMIN_IDS:
-            return await func(client, message)
+    """Decorator: only allow ADMIN_IDS to run a command."""
+    async def wrapper(client: Client, message: Message):
+        user = message.from_user
+        if not user:
+            return                                # anonymous / channel post
+        if ADMIN_IDS and user.id not in ADMIN_IDS:
+            return                                # not an admin
+        return await func(client, message)
     wrapper.__name__ = func.__name__
     return wrapper
 
 
-def extract_deeplinks(message: Message) -> list[tuple[str, str]]:
-    """Return list of (bot_username, start_param) from a message."""
-    links: list[tuple[str, str]] = []
+def _is_source_group(message: Message) -> bool:
+    """Return True if the message's chat is in our watched SOURCE_GROUPS."""
+    if not SOURCE_GROUPS:
+        return True   # no filter set → watch all groups
+    cid = message.chat.id
+    uname = (getattr(message.chat, "username", "") or "").lower()
+    for g in SOURCE_GROUPS:
+        if isinstance(g, int) and g == cid:
+            return True
+        if isinstance(g, str) and g == uname:
+            return True
+    return False
+
+
+def extract_deeplinks(message: Message) -> list:
+    """Return list of (bot_username, start_param) tuples from a message."""
+    links = []
     # Inline keyboard buttons
     if message.reply_markup and hasattr(message.reply_markup, "inline_keyboard"):
         for row in message.reply_markup.inline_keyboard:
@@ -161,35 +185,42 @@ def extract_deeplinks(message: Message) -> list[tuple[str, str]]:
     return links
 
 
-async def _enqueue(bot_username: str, start_param: str) -> bool:
-    """Queue a start param. Returns True if newly queued, False if already processed."""
-    with _proc_lock:
+async def _enqueue(bot_username: str, start_param: str, force_save: bool = False) -> bool:
+    """
+    Queue a start param for PM delivery.
+    Returns True if newly queued, False if already processed.
+    Batches disk writes every _SAVE_BATCH items to avoid blocking the event loop.
+    """
+    global _unsaved_count
+    async with _proc_lock:
         if start_param in _processed:
             return False
         _processed.add(start_param)
-        _save_processed(_processed)
-    await _queue.put((bot_username, start_param))
+        _unsaved_count += 1
+        should_save = force_save or (_unsaved_count >= _SAVE_BATCH)
+        if should_save:
+            snapshot = set(_processed)
+            _unsaved_count = 0
+
+    if should_save:
+        # Run disk write in a thread so we don't block the event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _flush_processed, snapshot)
+
+    if _queue is not None:
+        await _queue.put((bot_username, start_param))
     _stats["queued"] += 1
-    logger.info(f"Queued: @{bot_username} start={start_param} (total={_stats['queued']})")
+    logger.info(f"Queued @{bot_username} start={start_param} (total={_stats['queued']})")
     return True
 
 
 # ── Watch source groups for bot result messages ───────────────────────────────
-@app.on_message(filters.incoming)
-async def on_any_message(client: Client, message: Message):
-    # Only care about watched groups
-    if SOURCE_GROUPS:
-        chat_id = message.chat.id
-        chat_username = (getattr(message.chat, "username", "") or "").lower()
-        matched = any(
-            (isinstance(g, int) and g == chat_id) or
-            (isinstance(g, str) and g.lstrip("@").lower() == chat_username)
-            for g in SOURCE_GROUPS
-        )
-        if not matched:
-            return
+@app.on_message(filters.group & filters.incoming)
+async def on_group_message(client: Client, message: Message):
+    """Fires only in group/supergroup chats — never in PMs."""
+    if not _is_source_group(message):
+        return
 
-    # Only process messages from the target bot
     sender = message.from_user or message.sender_chat
     username = (getattr(sender, "username", "") or "").lower()
     if username != SOURCE_BOT.lower():
@@ -211,6 +242,7 @@ async def on_any_message(client: Client, message: Message):
 # ── Watch PM for files from the source bot ────────────────────────────────────
 @app.on_message(filters.private & filters.incoming)
 async def on_pm_file(client: Client, message: Message):
+    """Captures every file the source bot sends in PM and forwards it."""
     sender = message.from_user or message.sender_chat
     username = (getattr(sender, "username", "") or "").lower()
     if username != SOURCE_BOT.lower():
@@ -224,13 +256,13 @@ async def on_pm_file(client: Client, message: Message):
     if not unique_id:
         return
 
-    # Permanent deduplication check
+    # Permanent dedup check — survives restarts
     if _is_seen(unique_id):
         _stats["skipped_dup"] += 1
-        logger.info(f"⏭ Skipped duplicate: {unique_id} (total skipped={_stats['skipped_dup']})")
+        logger.info(f"⏭ Duplicate skipped: {unique_id} (total={_stats['skipped_dup']})")
         return
 
-    # Mark as seen BEFORE forwarding to prevent race conditions
+    # Mark BEFORE forwarding to prevent race condition on concurrent PM messages
     _mark_seen(unique_id)
 
     try:
@@ -242,7 +274,7 @@ async def on_pm_file(client: Client, message: Message):
         logger.error(f"Forward error: {e}")
 
 
-# ── Queue worker ──────────────────────────────────────────────────────────────
+# ── Queue worker: sends /start <param> to bot in PM ──────────────────────────
 async def _queue_worker():
     logger.info("Queue worker started")
     while True:
@@ -255,8 +287,7 @@ async def _queue_worker():
             _stats["errors"] += 1
         finally:
             _queue.task_done()
-        # Rate limit: keep delay between PM requests
-        await asyncio.sleep(PM_DELAY)
+        await asyncio.sleep(PM_DELAY)   # rate-limit between PM sends
 
 
 # ── /dumpbot ──────────────────────────────────────────────────────────────────
@@ -269,14 +300,15 @@ async def cmd_dumpbot(client: Client, message: Message):
             "**Usage:** `/dumpbot <group_id or @username> [limit]`\n\n"
             f"Scans group history for @{SOURCE_BOT} result messages\n"
             "and queues every unseen deep link.\n\n"
-            "Default limit: `10000` messages",
+            "Default limit: `10000` messages\n"
+            "Example: `/dumpbot -1001234567890 50000`",
             parse_mode="markdown"
         )
         return
 
     group = args[1].strip()
     try:
-        group_id: int | str = int(group)
+        group_id = int(group)
     except ValueError:
         group_id = group
 
@@ -306,7 +338,7 @@ async def cmd_dumpbot(client: Client, message: Message):
                         f"🔍 Scanned: `{scanned:,}` messages\n"
                         f"📨 Bot results found: `{found_msgs}`\n"
                         f"🔗 New links queued: `{queued}`\n"
-                        f"⏳ Queue size: `{_queue.qsize()}`",
+                        f"⏳ Queue size: `{_queue.qsize() if _queue else 0}`",
                         parse_mode="markdown"
                     )
                 except Exception:
@@ -316,21 +348,26 @@ async def cmd_dumpbot(client: Client, message: Message):
     except Exception as e:
         await prog.edit(f"❌ Scan error: `{e}`", parse_mode="markdown")
         return
+    finally:
+        # Force-save any remaining unsaved processed params
+        if _unsaved_count > 0:
+            await asyncio.get_event_loop().run_in_executor(None, _flush_processed, set(_processed))
 
-    eta_min = (_queue.qsize() * PM_DELAY) / 60
+    q_size = _queue.qsize() if _queue else 0
+    eta_min = (q_size * PM_DELAY) / 60
     await prog.edit(
         f"✅ **Dump scan complete**\n\n"
         f"📜 Messages scanned: `{scanned:,}`\n"
         f"📨 Bot results found: `{found_msgs}`\n"
         f"🔗 New links queued: `{queued}`\n"
-        f"⏳ Queue size: `{_queue.qsize()}` — ETA ~`{eta_min:.0f}` min\n\n"
+        f"⏳ Queue size: `{q_size}` — ETA ~`{eta_min:.0f}` min\n\n"
         f"Files will forward to `{DEST_CHANNEL}` as the queue processes.\n"
-        f"Already-seen files will be skipped automatically.",
+        f"Already-seen files are skipped automatically.",
         parse_mode="markdown"
     )
     if LOG_CHANNEL:
         try:
-            await client.send_message(LOG_CHANNEL, f"🗂 Dump queued {queued} links from {group}")
+            await client.send_message(LOG_CHANNEL, f"🗂 Dump: queued {queued} links from {group}")
         except Exception:
             pass
 
@@ -339,18 +376,19 @@ async def cmd_dumpbot(client: Client, message: Message):
 @app.on_message(filters.command("pmstatus") & filters.private)
 @_admin_only
 async def cmd_pmstatus(client: Client, message: Message):
-    eta_min = (_queue.qsize() * PM_DELAY) / 60
+    q_size = _queue.qsize() if _queue else 0
+    eta_min = (q_size * PM_DELAY) / 60
     dedup_info = "seen_db (persistent ✅)" if _USE_SEEN_DB else "in-memory ⚠️"
     await message.reply(
         f"**📊 PM Bot Forwarder Status**\n\n"
         f"🤖 Source bot: @{SOURCE_BOT}\n"
-        f"👁 Watching groups: `{len(SOURCE_GROUPS)}`\n"
+        f"👁 Watching: `{len(SOURCE_GROUPS)} group(s)` (empty = all)\n"
         f"📺 Destination: `{DEST_CHANNEL}`\n"
-        f"🔁 Deduplication: {dedup_info}\n\n"
+        f"🔁 Dedup: {dedup_info}\n\n"
         f"🔗 Start params processed: `{len(_processed):,}`\n"
         f"✅ Files forwarded: `{_stats['forwarded']:,}`\n"
         f"⏭ Duplicates skipped: `{_stats['skipped_dup']:,}`\n"
-        f"⏳ Queue size: `{_queue.qsize():,}` (~`{eta_min:.0f}` min remaining)\n"
+        f"⏳ Queue size: `{q_size:,}` (~`{eta_min:.0f}` min remaining)\n"
         f"❌ Errors: `{_stats['errors']}`",
         parse_mode="markdown"
     )
@@ -363,20 +401,20 @@ async def cmd_pmclear(client: Client, message: Message):
     args = message.text.split(None, 1)
     if len(args) < 2 or args[1].strip().lower() != "confirm":
         await message.reply(
-            f"⚠️ This clears `{len(_processed):,}` processed-link records from `{_PROCESSED_FILE}`.\n"
-            f"Previously seen deep links will be re-sent to @{SOURCE_BOT}.\n"
-            f"Note: file deduplication (seen_db) is NOT cleared — no duplicate files will be forwarded.\n\n"
+            f"⚠️ This clears `{len(_processed):,}` processed-link records.\n"
+            f"Deep links will be re-sent to @{SOURCE_BOT} on next encounter.\n"
+            f"**File dedup (seen_db) is NOT cleared** — no duplicate files forwarded.\n\n"
             f"Send `/pmclear confirm` to proceed.",
             parse_mode="markdown"
         )
         return
-    with _proc_lock:
+    async with _proc_lock:
         n = len(_processed)
         _processed.clear()
-        _save_processed(_processed)
+    await asyncio.get_event_loop().run_in_executor(None, _flush_processed, set())
     await message.reply(
         f"🗑 Cleared `{n:,}` processed-link records.\n"
-        f"File dedup (seen_db) kept intact — no duplicates will be forwarded.",
+        f"File dedup (seen_db) intact — no duplicates will be forwarded.",
         parse_mode="markdown"
     )
 
@@ -387,10 +425,10 @@ async def cmd_help(client: Client, message: Message):
     me = await client.get_me()
     await message.reply(
         f"**PM Bot Forwarder** — `{me.first_name}`\n\n"
-        f"Watches for @{SOURCE_BOT} results and forwards all files to `{DEST_CHANNEL}`.\n"
-        f"Duplicate files are permanently skipped (survives restarts).\n\n"
+        f"Watches @{SOURCE_BOT} results and forwards all files to `{DEST_CHANNEL}`.\n"
+        f"Duplicates are permanently skipped (survives restarts).\n\n"
         "**Commands:**\n"
-        "• `/dumpbot <group> [limit]` — scan history and queue all past deep links\n"
+        "• `/dumpbot <group> [limit]` — scan history, queue all past deep links\n"
         "• `/pmstatus` — queue, forwarded, skipped counts\n"
         "• `/pmclear confirm` — reset processed-links cache (keeps file dedup)\n",
         parse_mode="markdown"
@@ -406,10 +444,9 @@ async def main():
     me = await app.get_me()
     logger.info(f"🚀 PM Bot Forwarder started as: {me.first_name} (@{me.username})")
     logger.info(f"🤖 Source bot: @{SOURCE_BOT}")
-    logger.info(f"📺 Destination channel: {DEST_CHANNEL}")
-    logger.info(f"👁 Watching {len(SOURCE_GROUPS)} source group(s): {SOURCE_GROUPS}")
-    logger.info(f"⏱ PM delay: {PM_DELAY}s between requests")
-    logger.info(f"🔁 Dedup mode: {'seen_db (persistent)' if _USE_SEEN_DB else 'in-memory'}")
+    logger.info(f"📺 Destination: {DEST_CHANNEL}")
+    logger.info(f"👁 Watching {len(SOURCE_GROUPS)} group(s): {SOURCE_GROUPS or 'ALL'}")
+    logger.info(f"⏱ PM delay: {PM_DELAY}s | Dedup: {'seen_db' if _USE_SEEN_DB else 'in-memory'}")
 
     asyncio.create_task(_queue_worker())
 
@@ -417,15 +454,21 @@ async def main():
         try:
             await app.send_message(
                 LOG_CHANNEL,
-                f"✅ **PM Bot Forwarder started**\nAs: `{me.first_name}`\n"
-                f"Source: @{SOURCE_BOT} | Groups: {len(SOURCE_GROUPS)}\n"
-                f"Dedup: {'seen_db ✅' if _USE_SEEN_DB else 'in-memory ⚠️'}"
+                f"✅ **PM Bot Forwarder started**\n"
+                f"As: `{me.first_name}` | Source: @{SOURCE_BOT}\n"
+                f"Groups: {len(SOURCE_GROUPS)} | Dedup: {'seen_db ✅' if _USE_SEEN_DB else 'in-memory ⚠️'}"
             )
         except Exception:
             pass
 
-    logger.info("⏳ Listening...")
+    logger.info("⏳ Listening for bot results...")
     await idle()
+
+    # Graceful shutdown: flush any unsaved processed params
+    if _unsaved_count > 0:
+        logger.info("Flushing processed params on shutdown...")
+        _flush_processed(_processed)
+
     await app.stop()
 
 
