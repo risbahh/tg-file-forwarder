@@ -75,8 +75,20 @@ ADMIN_IDS    = [
 _PROCESSED_FILE = os.environ.get("PM_PROCESSED_FILE", "pm_processed.json")
 
 # ── Caption watermark replacement ─────────────────────────────────────────────
-# Set MY_USERNAME and/or MY_CHANNEL_URL to replace bot watermarks with your own.
-# If neither is set, files are forwarded as-is (original caption preserved).
+# ── Caption mode — pick ONE of the three options below ───────────────────────
+#
+#  Option A — Strip all captions completely (no tags, no "Forwarded from"):
+#    STRIP_CAPTION = true
+#
+#  Option B — Replace bot tags with your own (MY_USERNAME / MY_CHANNEL_URL):
+#    STRIP_CAPTION = false (default)
+#    MY_USERNAME   = Moviebot123
+#    MY_CHANNEL_URL= https://t.me/backupchannek
+#
+#  Option C — Keep original captions as-is:
+#    STRIP_CAPTION = false, leave MY_USERNAME and MY_CHANNEL_URL empty
+#
+STRIP_CAPTION  = os.environ.get("STRIP_CAPTION", "false").lower() in ("1", "true", "yes")
 MY_USERNAME    = os.environ.get("MY_USERNAME", "").lstrip("@").strip()
 MY_CHANNEL_URL = os.environ.get("MY_CHANNEL_URL", "").strip()
 
@@ -372,17 +384,18 @@ async def on_pm_file(client: Client, message: Message):
     _mark_seen(unique_id)
 
     try:
-        cleaned = _clean_caption(message.caption)
-        caption_changed = cleaned != message.caption
-
-        if caption_changed or MY_USERNAME or MY_CHANNEL_URL:
-            # Use copy() so we can inject the cleaned caption.
-            # copy() sends the file fresh without a "Forwarded from" header.
+        if STRIP_CAPTION:
+            # Completely silent forward — no caption, no "Forwarded from" header.
+            # Users cannot tell where the file came from.
+            await message.copy(DEST_CHANNEL, caption="")
+        elif MY_USERNAME or MY_CHANNEL_URL:
+            # Replace bot watermarks with owner's details, then copy (no forward header).
+            cleaned = _clean_caption(message.caption)
             await message.copy(DEST_CHANNEL, caption=cleaned)
-            if caption_changed:
-                logger.debug(f"Caption cleaned: {message.caption!r} → {cleaned!r}")
+            if cleaned != message.caption:
+                logger.debug(f"Caption replaced: {message.caption!r} → {cleaned!r}")
         else:
-            # No replacement configured — plain forward (preserves original formatting)
+            # Keep original caption — plain forward (shows "Forwarded from" header).
             await message.forward(DEST_CHANNEL)
 
         _stats["forwarded"] += 1
@@ -516,12 +529,15 @@ async def cmd_pmstatus(client: Client, message: Message):
         f"{_stats['by_bot'].get(b.lower(), {}).get('forwarded', 0)} forwarded"
         for b in SOURCE_BOTS_LIST
     )
-    caption_parts = []
-    if MY_USERNAME:
-        caption_parts.append(f"@mentions → @{MY_USERNAME}")
-    if MY_CHANNEL_URL:
-        caption_parts.append(f"links → {MY_CHANNEL_URL}")
-    caption_status = " | ".join(caption_parts) if caption_parts else "off (forwarding original captions)"
+    if STRIP_CAPTION:
+        caption_status = "🚫 stripped (no caption, no forward header)"
+    elif MY_USERNAME or MY_CHANNEL_URL:
+        parts = []
+        if MY_USERNAME:    parts.append(f"@mentions → @{MY_USERNAME}")
+        if MY_CHANNEL_URL: parts.append(f"links → {MY_CHANNEL_URL}")
+        caption_status = " | ".join(parts)
+    else:
+        caption_status = "original (forwarded as-is)"
     await message.reply(
         f"**📊 PM Bot Forwarder Status**\n\n"
         f"🤖 Bots watched ({len(SOURCE_BOTS_LIST)}):\n{bots_str}\n\n"
