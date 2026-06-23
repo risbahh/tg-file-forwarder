@@ -2,7 +2,11 @@
 failed_db.py — Stores message IDs that failed all forwarding retries.
 Persists to failed.json so /retry can recover files lost during FloodWait.
 
-Entry format: {"chat_id": int, "message_id": int, "ts": float}
+Entry format: {"chat_id": int, "message_id": int, "dest": int, "ts": float}
+  chat_id    — source chat the message came from
+  message_id — Telegram message ID
+  dest       — intended destination channel (0 = unknown, falls back to DEST_CHANNEL)
+  ts         — Unix timestamp when the failure was recorded
 """
 import json
 import os
