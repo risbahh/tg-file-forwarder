@@ -86,6 +86,8 @@ tg-file-forwarder/
 | `SOURCE_BOT` | pm only | Legacy fallback if `SOURCE_BOTS` not set (default: NarutoXMoviesBot) |
 | `SOURCE_GROUPS` | pm only | Groups to watch for PM bot results (empty = all groups) |
 | `PM_DELAY` | pm only | Seconds between PM start commands (default: 4) |
+| `MY_USERNAME` | pm only | Your username WITHOUT @ — replaces every @mention in forwarded file captions |
+| `MY_CHANNEL_URL` | pm only | Your channel URL — replaces every t.me/... link in forwarded file captions |
 
 ---
 
@@ -248,6 +250,7 @@ Both entry points support the same commands. DM the userbot account to use them.
 | 10 | `pm_bot_forwarder.py` | Dedup key was bare `start_param` — BotA:files_123 and BotB:files_123 treated as same | Key changed to `"botname:start_param"` |
 | 10 | `pm_bot_forwarder.py` | `_admin_only` had no `functools.wraps` — stripped `__doc__`, `__module__` from handlers | Added `@wraps(func)` |
 | 10 | `pm_bot_forwarder.py` | `/pmstatus`, `/pmclear`, `/dumpbot`, `/help` all referenced single SOURCE_BOT | All updated to show full bot list + per-bot stats |
+| 10 | `pm_bot_forwarder.py` | Files forwarded with original bot watermarks (@NarutoXMoviesBot etc.) in captions | Added `MY_USERNAME` + `MY_CHANNEL_URL` caption replacement via `_clean_caption()` + `message.copy()` |
 
 ---
 
@@ -255,7 +258,9 @@ Both entry points support the same commands. DM the userbot account to use them.
 
 1. ~~**Multi-source bot support in `pm_bot_forwarder.py`**~~ ✅ **DONE (Session 10)** — `SOURCE_BOTS` env var, multi-bot set lookup, per-bot stats.
 
-2. **Quality routing in `pm_bot_forwarder.py`** — the PM bot sends multiple quality versions of each movie (480p, 720p, 1080p). Add `PREFERRED_QUALITY=1080p` env var to filter which versions get forwarded.
+2. ~~**Caption watermark replacement**~~ ✅ **DONE (Session 10)** — `MY_USERNAME` + `MY_CHANNEL_URL` replace all @mentions and t.me links before forwarding using `_clean_caption()` + `message.copy()`.
+
+3. **Quality routing in `pm_bot_forwarder.py`** — the PM bot sends multiple quality versions of each movie (480p, 720p, 1080p). Add `PREFERRED_QUALITY=1080p` env var to filter which versions get forwarded.
 
 3. **`/schedule off HH:MM HH:MM`** — quiet-hours auto-pause. User declined for PM forwarder (wants 24/7) but may be useful for `forwarder.py` to reduce Railway compute costs during off-hours.
 
